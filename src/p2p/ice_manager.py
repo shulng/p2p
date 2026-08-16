@@ -40,24 +40,29 @@ class IceManager:
         self.on_connection_state = on_connection_state
         self.on_ice_gathering_done = on_ice_gathering_done
         self.on_remote_address = on_remote_address
-        
+        self.on_data_received: Optional[Callable[[bytes], None]] = None
+
         # 状态
         self.state: ConnectionState = ConnectionState.DISCONNECTED
         self.ice_state: Optional[str] = None
         self.gathering_done: bool = False
-        
+
         # PeerConnection (aiortc)
         self._pc: Optional["RTCPeerConnection"] = None
         self._peer_id: str = generate_peer_id()
-        
+
+        # DataChannel
+        self._data_channel = None
+        self._data_channel_open: asyncio.Event = asyncio.Event()
+
         # 事件
         self._gathering_done_event: asyncio.Event = asyncio.Event()
         self._connected_event: asyncio.Event = asyncio.Event()
-        
+
         # 收集到的候选地址
         self.local_candidates: List[LocalIceCandidate] = []
         self.remote_candidates: List[LocalIceCandidate] = []
-        
+
         # 选中的候选对
         self.selected_local_candidate: Optional[LocalIceCandidate] = None
         self.selected_remote_candidate: Optional[LocalIceCandidate] = None
@@ -96,10 +101,7 @@ class IceManager:
         if has_cloudflare:
             logger.info("[ICE] Using Cloudflare TURN servers (turn.cloudflare.com:3478)")
         
-        return RTCConfiguration(
-            iceServers=ice_servers,
-            iceTransportPolicy=self.config.ice_transport_policy,
-        )
+        return RTCConfiguration(iceServers=ice_servers)
 
     async def create_offer(self) -> SessionDescription:
         """
@@ -116,10 +118,11 @@ class IceManager:
         # 注册事件
         self._register_events()
         
-        # 添加一个数据通道来触发 ICE
+        # 添加一个数据通道来触发 ICE 并用于数据传输
         try:
-            data_channel = self._pc.createDataChannel("p2p-ice")
-            logger.debug("[ICE] Created data channel for ICE triggering")
+            self._data_channel = self._pc.createDataChannel("p2p-data", ordered=True)
+            self._register_data_channel_events(self._data_channel)
+            logger.debug("[ICE] Created data channel 'p2p-data'")
         except Exception as e:
             logger.warning(f"[ICE] Could not create data channel: {e}")
         
@@ -262,6 +265,51 @@ class IceManager:
         async def on_connection_state():
             state = self._pc.connectionState
             logger.info(f"[ICE] Connection state: {state}")
+
+        @self._pc.on("datachannel")
+        def on_datachannel(channel):
+            logger.info(f"[ICE] Remote data channel received: {channel.label}")
+            self._data_channel = channel
+            self._register_data_channel_events(channel)
+
+    def _register_data_channel_events(self, channel) -> None:
+        """注册 DataChannel 事件"""
+        @channel.on("open")
+        def on_open():
+            logger.info("[ICE] DataChannel opened")
+            self._data_channel_open.set()
+
+        @channel.on("message")
+        def on_message(message):
+            if isinstance(message, str):
+                message = message.encode("utf-8")
+            if self.on_data_received:
+                self.on_data_received(message)
+
+        @channel.on("close")
+        def on_close():
+            logger.info("[ICE] DataChannel closed")
+            self._data_channel_open.clear()
+
+    async def send_data(self, data: bytes) -> bool:
+        """通过 DataChannel 发送数据"""
+        if not self._data_channel or not self._data_channel_open.is_set():
+            return False
+        try:
+            self._data_channel.send(data)
+            return True
+        except Exception as e:
+            logger.error(f"[ICE] DataChannel send error: {e}")
+            return False
+
+    async def wait_for_data_channel(self, timeout: float = 15.0) -> bool:
+        """等待 DataChannel 打开"""
+        try:
+            await asyncio.wait_for(self._data_channel_open.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("[ICE] DataChannel open timeout")
+            return False
 
     async def _extract_selected_candidates(self) -> None:
         """尝试提取选中的候选地址（用于直接 UDP 传输）"""

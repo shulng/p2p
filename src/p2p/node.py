@@ -83,40 +83,8 @@ class P2PNode:
     async def initialize(self) -> None:
         """初始化节点"""
         logger.info(f"[P2PNode] Initializing {self.peer_id}, transport={self.config.transport.value}")
-        
-        # 1. 初始化 KCP (如果启用)
-        if self.config.transport in (TransportProtocol.KCP, TransportProtocol.AUTO):
-            try:
-                self._kcp = KCPTransport(
-                    config=self.config.kcp,
-                    on_data_received=self._on_kcp_data,
-                    on_connection_state=self._on_kcp_state,
-                )
-                self._kcp_local_addr = await self._kcp.bind(
-                    self.config.kcp.host, self.config.kcp.port
-                )
-                logger.info(f"[P2PNode] KCP bound to {self._kcp_local_addr}")
-            except Exception as e:
-                logger.warning(f"[P2PNode] KCP init failed: {e}")
-                self._kcp = None
-        
-        # 2. 初始化 QUIC (如果启用)
-        if self.config.transport in (TransportProtocol.QUIC, TransportProtocol.AUTO):
-            try:
-                self._quic = QUICTransport(
-                    config=self.config.quic,
-                    on_data_received=self._on_quic_data,
-                    on_connection_state=self._on_quic_state,
-                )
-                self._quic_local_addr = await self._quic.serve(
-                    self.config.quic.host, self.config.quic.port
-                )
-                logger.info(f"[P2PNode] QUIC listening on {self._quic_local_addr}")
-            except Exception as e:
-                logger.warning(f"[P2PNode] QUIC init failed: {e}")
-                self._quic = None
-        
-        # 3. 初始化 ICE
+
+        # 1. 初始化 ICE (使用 DataChannel 进行数据传输，支持 TURN 中继)
         self._ice = IceManager(
             config=self.config.ice,
             on_ice_candidate=self._on_ice_candidate,
@@ -124,6 +92,7 @@ class P2PNode:
             on_ice_gathering_done=self._on_ice_gathering_done,
             on_remote_address=self._on_ice_remote_addr,
         )
+        self._ice.on_data_received = self._on_ice_data
         logger.info("[P2PNode] ICE manager initialized (using Cloudflare TURN)")
         
         # 4. 初始化信令
@@ -276,58 +245,37 @@ class P2PNode:
         logger.info(f"[P2PNode] ICE remote address: {addr}")
 
     async def _establish_transports(self, peer_id: str) -> None:
-        """在 ICE 连接成功后建立传输层"""
+        """在 ICE 连接成功后建立传输层 (使用 DataChannel)"""
         remote_addr = self._ice.selected_address
-        if not remote_addr:
-            logger.warning("[P2PNode] No ICE selected address, cannot establish transports")
+
+        logger.info(f"[P2PNode] Establishing DataChannel with {peer_id}")
+
+        # 等待 DataChannel 打开
+        dc_ok = await self._ice.wait_for_data_channel(timeout=15.0)
+        if not dc_ok:
+            logger.warning("[P2PNode] DataChannel failed to open")
             return
-        
-        logger.info(f"[P2PNode] Establishing transports with {peer_id} @ {remote_addr}")
-        
+
         peer_data = {
             "peer_id": peer_id,
-            "state": ConnectionState.CONNECTING,
+            "state": ConnectionState.CONNECTED,
             "ice_addr": remote_addr,
-            "kcp": None,
-            "quic": None,
+            "transport": "datachannel",
         }
-        
-        # 根据配置建立传输层
-        if self.config.transport in (TransportProtocol.KCP, TransportProtocol.AUTO):
-            if self._kcp:
-                # 使用同一个 KCP 传输层连接到远端
-                # 对于服务端/客户端模式的处理
-                if self.config.role == ConnectionRole.INITIATOR:
-                    kcp_ok = await self._kcp.connect(remote_addr)
-                else:
-                    # 响应方等待连接
-                    kcp_ok = await self._kcp.accept_connection(remote_addr)
-                
-                if kcp_ok:
-                    peer_data["kcp"] = self._kcp
-                    logger.info(f"[P2PNode] KCP established with {peer_id}")
-        
-        if self.config.transport in (TransportProtocol.QUIC, TransportProtocol.AUTO):
-            if self.config.role == ConnectionRole.INITIATOR and self._quic:
-                quic_ok = await self._quic.connect(remote_addr[0], self._quic_local_addr[1] if self._quic_local_addr else remote_addr[1])
-                # 实际上 QUIC 端口不同，这里简化处理
-                # 实际场景中应该通过信令交换 QUIC 端口
-                peer_data["quic"] = self._quic if quic_ok else None
-            elif self._quic:
-                peer_data["quic"] = self._quic
-        
-        peer_data["state"] = ConnectionState.CONNECTED
+
         self._peers[peer_id] = peer_data
-        
         self._set_state(ConnectionState.CONNECTED)
-        
+
+        remote_ip = remote_addr[0] if remote_addr else "unknown"
+        remote_port = remote_addr[1] if remote_addr else 0
+
         peer_info = PeerInfo(
             peer_id=peer_id,
             role=ConnectionRole.RESPONDER
             if self.config.role == ConnectionRole.INITIATOR
             else ConnectionRole.INITIATOR,
-            address=remote_addr[0],
-            port=remote_addr[1],
+            address=remote_ip,
+            port=remote_port,
             transport=self.config.transport,
         )
         
@@ -389,6 +337,10 @@ class P2PNode:
         """QUIC 状态变化"""
         logger.debug(f"[P2PNode] QUIC state: {state}")
 
+    def _on_ice_data(self, data: bytes) -> None:
+        """收到 DataChannel 数据"""
+        self._handle_transport_data(data, self.config.transport)
+
     def _handle_transport_data(self, data: bytes, transport: TransportProtocol) -> None:
         """处理从传输层收到的数据"""
         try:
@@ -448,11 +400,11 @@ class P2PNode:
         payload: Any = None,
         prefer_transport: Optional[TransportProtocol] = None,
     ) -> bool:
-        """发送消息到指定 Peer"""
+        """发送消息到指定 Peer (通过 ICE DataChannel)"""
         if peer_id not in self._peers:
             logger.warning(f"[P2PNode] Unknown peer: {peer_id}")
             return False
-        
+
         msg = Message.create(
             msg_type=msg_type,
             sender_id=self.peer_id,
@@ -460,21 +412,11 @@ class P2PNode:
             payload=payload,
         )
         data = self._encode_message(msg)
-        
-        peer_data = self._peers[peer_id]
-        transport = prefer_transport or self.config.transport
-        
-        # 尝试发送
-        if transport in (TransportProtocol.KCP, TransportProtocol.AUTO):
-            kcp = peer_data.get("kcp") or self._kcp
-            if kcp and kcp.state == ConnectionState.CONNECTED:
-                return await kcp.send(data)
-        
-        if transport in (TransportProtocol.QUIC, TransportProtocol.AUTO):
-            quic = peer_data.get("quic") or self._quic
-            if quic and quic.state == ConnectionState.CONNECTED:
-                return await quic.send(data)
-        
+
+        # 通过 ICE DataChannel 发送
+        if self._ice:
+            return await self._ice.send_data(data)
+
         logger.warning(f"[P2PNode] No transport available for {peer_id}")
         return False
 

@@ -206,8 +206,8 @@ class SignalingClient:
                     sdp_type=msg.get("sdp_type", "offer"),
                     sdp=msg.get("sdp", ""),
                 )
-                self.events.on_offer(from_peer, offer)
-                
+                asyncio.create_task(self.events.on_offer(from_peer, offer))
+
         elif msg_type == MessageType.SIGNAL_ANSWER.value:
             # 收到 Answer
             if from_peer and self.events.on_answer:
@@ -215,8 +215,8 @@ class SignalingClient:
                     sdp_type=msg.get("sdp_type", "answer"),
                     sdp=msg.get("sdp", ""),
                 )
-                self.events.on_answer(from_peer, answer)
-                
+                asyncio.create_task(self.events.on_answer(from_peer, answer))
+
         elif msg_type == MessageType.SIGNAL_ICE_CANDIDATE.value:
             # 收到 ICE 候选
             if from_peer and self.events.on_ice_candidate:
@@ -225,7 +225,7 @@ class SignalingClient:
                     sdp_mid=msg.get("sdp_mid"),
                     sdp_mline_index=msg.get("sdp_mline_index"),
                 )
-                self.events.on_ice_candidate(from_peer, candidate)
+                asyncio.create_task(self.events.on_ice_candidate(from_peer, candidate))
                 
         elif msg_type == MessageType.SIGNAL_ROOM_INFO.value:
             # 房间信息更新
@@ -251,11 +251,11 @@ class SignalingClient:
             for p in peers:
                 if p.peer_id in joined and self.events.on_peer_joined:
                     if p.peer_id != self.peer_id:
-                        self.events.on_peer_joined(p)
-            
+                        asyncio.create_task(self.events.on_peer_joined(p))
+
             for pid in left:
                 if self.events.on_peer_left:
-                    self.events.on_peer_left(pid)
+                    asyncio.create_task(self.events.on_peer_left(pid))
             
             self.room_peers = peers
             

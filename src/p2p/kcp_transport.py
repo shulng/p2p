@@ -104,30 +104,17 @@ class KCPTransport:
         :return: (host, port)
         """
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.setblocking(False)
-        
-        # 尝试绑定
-        max_attempts = 10 if port == 0 else 1
-        for attempt in range(max_attempts):
-            try:
-                bind_port = port if port != 0 else (49152 + attempt * 1000)
-                self._sock.bind((host, bind_port))
-                self._local_addr = self._sock.getsockname()
-                logger.info(f"[KCP] Bound to {self._local_addr}")
-                return self._local_addr
-            except OSError:
-                if port != 0:
-                    raise
-        
-        # 让系统分配端口
+
         if port == 0:
+            # 让系统自动分配可用端口，避免冲突
             self._sock.bind((host, 0))
-            self._local_addr = self._sock.getsockname()
-            logger.info(f"[KCP] Bound to {self._local_addr} (auto port)")
-            return self._local_addr
-        
-        raise RuntimeError("Failed to bind UDP socket")
+        else:
+            self._sock.bind((host, port))
+
+        self._local_addr = self._sock.getsockname()
+        logger.info(f"[KCP] Bound to {self._local_addr}")
+        return self._local_addr
 
     def set_remote(self, address: Tuple[str, int]) -> None:
         """
