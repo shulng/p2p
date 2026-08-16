@@ -271,6 +271,10 @@ class IceManager:
             logger.info(f"[ICE] Remote data channel received: {channel.label}")
             self._data_channel = channel
             self._register_data_channel_events(channel)
+            # 如果 DataChannel 已经是 open 状态，直接设置事件
+            if hasattr(channel, 'readyState') and channel.readyState == "open":
+                logger.info("[ICE] DataChannel already open")
+                self._data_channel_open.set()
 
     def _register_data_channel_events(self, channel) -> None:
         """注册 DataChannel 事件"""
@@ -304,10 +308,23 @@ class IceManager:
 
     async def wait_for_data_channel(self, timeout: float = 15.0) -> bool:
         """等待 DataChannel 打开"""
+        # 如果已经 open，直接返回
+        if self._data_channel_open.is_set():
+            return True
+        # 如果 DataChannel 存在且 readyState=open，直接设置
+        if self._data_channel and hasattr(self._data_channel, 'readyState'):
+            if self._data_channel.readyState == "open":
+                self._data_channel_open.set()
+                return True
         try:
             await asyncio.wait_for(self._data_channel_open.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
+            # 最后再检查一次 readyState
+            if self._data_channel and hasattr(self._data_channel, 'readyState'):
+                if self._data_channel.readyState == "open":
+                    self._data_channel_open.set()
+                    return True
             logger.warning("[ICE] DataChannel open timeout")
             return False
 

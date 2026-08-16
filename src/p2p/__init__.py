@@ -39,6 +39,7 @@ from .ice_manager import IceManager
 from .signaling_client import SignalingClient, SignalingEvents
 from .signaling_server import SignalingServer
 from .node import P2PNode
+from .game_tunnel import GameTunnel, TunnelConfig, GAME_PRESETS
 
 __all__ = [
     # Config
@@ -74,4 +75,8 @@ __all__ = [
     "SignalingServer",
     # Node
     "P2PNode",
+    # Game Tunnel
+    "GameTunnel",
+    "TunnelConfig",
+    "GAME_PRESETS",
 ]

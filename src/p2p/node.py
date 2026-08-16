@@ -350,7 +350,9 @@ class P2PNode:
                 f"from {msg.sender_id}"
             )
             if self.on_message:
-                self.on_message(msg)
+                result = self.on_message(msg)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
         except Exception as e:
             # 如果不是 Message 格式，当作原始二进制数据
             msg = Message.create(

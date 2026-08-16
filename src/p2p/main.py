@@ -5,6 +5,7 @@ import asyncio
 import argparse
 import sys
 import signal
+from typing import Optional
 from loguru import logger
 
 from .config import (
@@ -15,6 +16,7 @@ from .config import (
 )
 from .node import P2PNode
 from .types import Message, MessageType, PeerInfo, ConnectionState
+from .game_tunnel import GameTunnel, TunnelConfig, GAME_PRESETS
 
 
 async def run_initiator(
@@ -275,6 +277,61 @@ async def run_benchmark(
     return 0
 
 
+async def run_game_tunnel(
+    signaling_url: str,
+    room_id: str,
+    role: ConnectionRole,
+    game: str,
+    local_port: Optional[int],
+    remote_port: Optional[int],
+):
+    """游戏隧道模式 - 用于 Minecraft 等游戏联机"""
+    # 获取游戏预设配置
+    tunnel_config = GAME_PRESETS.get(game, GAME_PRESETS["custom"]).__class__(
+        **GAME_PRESETS.get(game, GAME_PRESETS["custom"]).__dict__
+    )
+
+    # 覆盖自定义端口
+    if local_port:
+        tunnel_config.local_listen_port = local_port
+    if remote_port:
+        tunnel_config.remote_forward_port = remote_port
+
+    p2p_config = P2PConfig(
+        transport=TransportProtocol.AUTO,
+        role=role,
+        ice=IceConfig.with_cloudflare_turn(),
+    )
+    p2p_config.signaling.server_url = signaling_url
+
+    tunnel = GameTunnel(p2p_config, tunnel_config, role)
+
+    # 定期打印统计
+    async def print_stats():
+        while True:
+            await asyncio.sleep(30)
+            stats = tunnel.get_stats()
+            logger.info(
+                f"[STATS] Active tunnels: {stats['active_tunnels']}, "
+                f"Total: {stats['total_connections']}, "
+                f"Forwarded: {stats['bytes_forwarded_mb']} MB"
+            )
+
+    stats_task = asyncio.create_task(print_stats())
+
+    try:
+        await tunnel.start(signaling_url, room_id)
+        # 保持运行
+        while True:
+            await asyncio.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stats_task.cancel()
+        await tunnel.stop()
+    return 0
+
+
 def main():
     """CLI 入口"""
     parser = argparse.ArgumentParser(
@@ -284,30 +341,39 @@ def main():
 Examples:
   # 1. 启动信令服务器 (终端1)
   $ p2p-signaling --port 8765
-  
-  # 2. 启动发起方 (终端2)
+
+  # 2. P2P 通信测试
   $ p2p --mode initiator --room test123 --transport auto
-  
-  # 3. 启动响应方 (终端3)
   $ p2p --mode responder --room test123 --transport auto
-  
+
+  # 3. Minecraft 联机 (Java Edition, TCP 25565)
+  #    HOST 端 (运行 MC 服务端的人):
+  $ p2p --mode game --game mc-java --role host --room mc-room-001
+  #    CLIENT 端 (运行 MC 客户端的人):
+  $ p2p --mode game --game mc-java --role client --room mc-room-001
+  #    然后 MC 客户端连接 -> 127.0.0.1:25565
+
+  # 4. 自定义端口
+  $ p2p --mode game --game custom --role host --room my-room --remote-port 25566
+  $ p2p --mode game --game custom --role client --room my-room --local-port 25566
+
   # 性能测试
   $ p2p --mode benchmark --role initiator --room bench1
   $ p2p --mode benchmark --role responder --room bench1
         """,
     )
-    
+
     parser.add_argument(
         "--mode",
-        choices=["initiator", "responder", "benchmark"],
+        choices=["initiator", "responder", "benchmark", "game"],
         default="initiator",
-        help="运行模式 (默认: initiator)",
+        help="运行模式: initiator|responder|benchmark|game (默认: initiator)",
     )
     parser.add_argument(
         "--transport",
         choices=["quic", "kcp", "auto"],
         default="auto",
-        help="传输协议 (默认: auto - 优先 KCP)",
+        help="传输协议 (默认: auto)",
     )
     parser.add_argument(
         "--signaling",
@@ -321,15 +387,34 @@ Examples:
     )
     parser.add_argument(
         "--role",
-        choices=["initiator", "responder"],
+        choices=["initiator", "responder", "host", "client"],
         default=None,
-        help="benchmark 模式下使用的角色",
+        help="角色: initiator|responder (通信), host|client (游戏)",
     )
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
         help="日志级别",
+    )
+    # 游戏模式参数
+    parser.add_argument(
+        "--game",
+        choices=list(GAME_PRESETS.keys()),
+        default="mc-java",
+        help="游戏预设: mc-java|mc-bedrock|terraria|dont-starve|custom (默认: mc-java)",
+    )
+    parser.add_argument(
+        "--local-port",
+        type=int,
+        default=None,
+        help="本地监听端口 (client 端, MC客户端连接此端口)",
+    )
+    parser.add_argument(
+        "--remote-port",
+        type=int,
+        default=None,
+        help="远端转发端口 (host 端, MC服务端运行的端口)",
     )
     
     args = parser.parse_args()
@@ -348,12 +433,14 @@ Examples:
         "auto": TransportProtocol.AUTO,
     }
     transport = transport_map[args.transport]
-    
+
     role_map = {
         "initiator": ConnectionRole.INITIATOR,
         "responder": ConnectionRole.RESPONDER,
+        "host": ConnectionRole.RESPONDER,
+        "client": ConnectionRole.INITIATOR,
     }
-    
+
     try:
         if args.mode == "initiator":
             rc = asyncio.run(
@@ -368,6 +455,22 @@ Examples:
             rc = asyncio.run(
                 run_benchmark(args.signaling, args.room, role, transport)
             )
+        elif args.mode == "game":
+            if not args.role or args.role not in ("host", "client"):
+                logger.error("Game mode requires --role host or --role client")
+                rc = 1
+            else:
+                role = role_map[args.role]
+                rc = asyncio.run(
+                    run_game_tunnel(
+                        args.signaling,
+                        args.room,
+                        role,
+                        args.game,
+                        args.local_port,
+                        args.remote_port,
+                    )
+                )
         else:
             parser.print_help()
             rc = 1
