@@ -397,13 +397,10 @@ class P2PNode:
                 await ice.close()
             except Exception as e:
                 logger.debug(f"[P2PNode] Error closing IceManager for {peer_id}: {e}")
-        # 停止消息 worker：发送 None 停止信号
+        # 停止消息 worker：发送 None 停止信号（无上限队列不会满）
         queue = self._peer_msg_queues.pop(peer_id, None)
         if queue is not None:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            queue.put_nowait(None)
         worker = self._peer_msg_workers.pop(peer_id, None)
         if worker is not None:
             worker.cancel()
@@ -487,17 +484,15 @@ class P2PNode:
             self._enqueue_message(queue_key, msg)
 
     def _enqueue_message(self, peer_id: str, msg: Message) -> None:
-        """将消息放入 per-peer 队列，按到达顺序处理"""
+        """将消息放入 per-peer 队列（无上限队列，不丢消息）"""
         queue = self._get_or_create_msg_queue(peer_id)
-        try:
-            queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            logger.warning(f"[P2PNode] Message queue full for {peer_id}, dropping")
+        queue.put_nowait(msg)
 
     def _get_or_create_msg_queue(self, peer_id: str) -> "asyncio.Queue[Optional[Message]]":
         """获取或创建 per-peer 消息队列 + worker"""
         if peer_id not in self._peer_msg_queues:
-            queue: "asyncio.Queue[Optional[Message]]" = asyncio.Queue(maxsize=10000)
+            # 无上限队列：不主动丢消息，内存增长由对端发送速率决定
+            queue: "asyncio.Queue[Optional[Message]]" = asyncio.Queue()
             self._peer_msg_queues[peer_id] = queue
             self._peer_msg_workers[peer_id] = asyncio.create_task(
                 self._msg_worker(peer_id, queue)
