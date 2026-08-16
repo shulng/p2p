@@ -539,10 +539,10 @@ class P2PNode:
                 f"from {msg.sender_id}"
             )
         except Exception:
-            # 解码失败：包装成原始二进制消息
+            # 解码失败：包装成原始二进制消息（sender 用 peer_id 兜底，非数据包来源）
             msg = Message.create(
                 msg_type=MessageType.DATA_BINARY,
-                sender_id=sender,
+                sender_id=peer_id or "unknown",
                 receiver_id=self.peer_id,
                 payload=data,
             )

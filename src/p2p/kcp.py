@@ -235,23 +235,25 @@ class KCP:
                     self.rmt_wnd = seg.wnd
             
             if seg.cmd == KCP_CMD_ACK:
-                # 确认
-                if self.__check_ack(seg.sn) == 0:
+                # 确认：__check_ack 返回真表示序号有效可处理，判断逻辑不可写反
+                if self.__check_ack(seg.sn):
                     self.__parse_ack(seg.sn, seg.ts)
             elif seg.cmd == KCP_CMD_PUSH:
                 # 数据推送
                 repeat = False
                 if (seg.sn - self.rcv_nxt) >= 0 and \
                    (self.rcv_nxt + self.rcv_wnd - seg.sn) > 0:
+                    # 仅在窗口内且非重复的段才回 ACK，
+                    # 否则超窗段（sn >= rcv_nxt+rcv_wnd）也会被确认，
+                    # 导致发送方误以为所有段送达而提前清空 snd_buf。
                     self.__update_ack(seg.sn)
                     repeat = self.__insert_data_into_rcv_buf(seg)
-                
-                if not repeat:
-                    for ack_sn, ack_ts in self.acklist:
-                        if ack_sn == seg.sn:
-                            break
-                    else:
-                        self.acklist.append((seg.sn, seg.ts))
+                    if not repeat:
+                        for ack_sn, ack_ts in self.acklist:
+                            if ack_sn == seg.sn:
+                                break
+                        else:
+                            self.acklist.append((seg.sn, seg.ts))
             elif seg.cmd == KCP_CMD_WASK:
                 # 窗口探测
                 self.probe |= KCP_ASK_TELL
@@ -276,10 +278,10 @@ class KCP:
             else:
                 new_snd_buf.append(seg)
         self.snd_buf = new_snd_buf
+        # 仅在 snd_buf 非空时更新 snd_una；否则保持原值，
+        # 避免把 snd_una 虚高推到 snd_nxt（对端并未真正收到全部数据）。
         if self.snd_buf:
             self.snd_una = self.snd_buf[0].sn
-        else:
-            self.snd_una = self.snd_nxt
 
     def __check_ack(self, sn: int) -> int:
         return sn - self.snd_una >= 0 and self.snd_nxt - sn > 0
@@ -464,9 +466,13 @@ class KCP:
             self.snd_buf.append(newseg)
             snd_buf_count += 1
         
+        # 发送 ACK：无论 snd_buf 是否为空都必须独立发送，
+        # 否则纯接收方（无数据要发）永远不会回 ACK，导致发送方窗口填满后停止发送。
+        self.__flush_acks()
+        # 发送窗口探测：与 snd_buf 无关，否则窗口耗尽且无数据可重传时无法恢复发送
+        self.__flush_probe()
+        
         if not self.snd_buf:
-            if self.probe:
-                self.probe = 0
             return
         
         buffer = bytearray(self.mtu)
@@ -511,77 +517,11 @@ class KCP:
                 seg.una = self.rcv_nxt
                 
                 size = self.__encode_segment(seg, buffer)
-                
-                # 发送 ACK
-                for ack_sn, ack_ts in self.acklist:
-                    ack_seg = KCP_SEG(
-                        conv=self.conv,
-                        cmd=KCP_CMD_ACK,
-                        frg=0,
-                        wnd=self.__get_available_window(),
-                        ts=ack_ts,
-                        sn=ack_sn,
-                        una=self.rcv_nxt,
-                        resendts=0,
-                        rto=0,
-                        fastack=0,
-                        xmit=0,
-                        data=b"",
-                    )
-                    ack_buf = bytearray(self.mtu)
-                    ack_size = self.__encode_segment(ack_seg, ack_buf)
-                    self.output(bytes(ack_buf[:ack_size]), self, self.user)
-                
-                self.acklist = []
-                
-                # 窗口探测
-                if self.probe & KCP_ASK_SEND:
-                    if not (self.probe & KCP_ASK_TELL):
-                        self.probe &= ~KCP_ASK_SEND
-                    wask_seg = KCP_SEG(
-                        conv=self.conv,
-                        cmd=KCP_CMD_WASK,
-                        frg=0,
-                        wnd=self.__get_available_window(),
-                        ts=self.current,
-                        sn=0,
-                        una=self.rcv_nxt,
-                        resendts=0,
-                        rto=0,
-                        fastack=0,
-                        xmit=0,
-                        data=b"",
-                    )
-                    wask_buf = bytearray(self.mtu)
-                    wask_size = self.__encode_segment(wask_seg, wask_buf)
-                    self.output(bytes(wask_buf[:wask_size]), self, self.user)
-                elif self.probe & KCP_ASK_TELL:
-                    wins_seg = KCP_SEG(
-                        conv=self.conv,
-                        cmd=KCP_CMD_WINS,
-                        frg=0,
-                        wnd=self.__get_available_window(),
-                        ts=self.current,
-                        sn=0,
-                        una=self.rcv_nxt,
-                        resendts=0,
-                        rto=0,
-                        fastack=0,
-                        xmit=0,
-                        data=b"",
-                    )
-                    wins_buf = bytearray(self.mtu)
-                    wins_size = self.__encode_segment(wins_seg, wins_buf)
-                    self.output(bytes(wins_buf[:wins_size]), self, self.user)
-                    self.probe = 0
-                
                 self.output(bytes(buffer[:size]), self, self.user)
                 
                 count += 1
                 if seg.xmit >= self.dead_link:
                     self.state = -1
-        
-        self.probe = 0 if self.probe == KCP_ASK_TELL else self.probe
         
         # 拥塞控制 - 丢包时慢启动
         if lost:
@@ -607,6 +547,82 @@ class KCP:
         if self.snd_buf:
             self.snd_una = self.snd_buf[0].sn
 
+    def __flush_acks(self) -> None:
+        """发送所有待确认的 ACK 段
+
+        与 snd_buf 无关：纯接收方（不发送数据）也必须回 ACK，
+        否则发送方收不到确认，窗口会逐渐填满并停止发送。
+        """
+        if not self.acklist:
+            return
+        ack_buf = bytearray(self.mtu)
+        for ack_sn, ack_ts in self.acklist:
+            ack_seg = KCP_SEG(
+                conv=self.conv,
+                cmd=KCP_CMD_ACK,
+                frg=0,
+                wnd=self.__get_available_window(),
+                ts=ack_ts,
+                sn=ack_sn,
+                una=self.rcv_nxt,
+                resendts=0,
+                rto=0,
+                fastack=0,
+                xmit=0,
+                data=b"",
+            )
+            ack_size = self.__encode_segment(ack_seg, ack_buf)
+            self.output(bytes(ack_buf[:ack_size]), self, self.user)
+        self.acklist = []
+
+    def __flush_probe(self) -> None:
+        """发送窗口探测（WASK / WINS）
+
+        与 snd_buf 无关：当对端窗口为 0（rmt_wnd==0）时，必须主动发 WASK 请求
+        窗口更新，否则若恰好没有数据可重传（snd_buf 空），发送将永久卡死。
+        """
+        if not self.probe:
+            return
+        if self.probe & KCP_ASK_SEND:
+            if not (self.probe & KCP_ASK_TELL):
+                self.probe &= ~KCP_ASK_SEND
+            seg = KCP_SEG(
+                conv=self.conv,
+                cmd=KCP_CMD_WASK,
+                frg=0,
+                wnd=self.__get_available_window(),
+                ts=self.current,
+                sn=0,
+                una=self.rcv_nxt,
+                resendts=0,
+                rto=0,
+                fastack=0,
+                xmit=0,
+                data=b"",
+            )
+            buf = bytearray(self.mtu)
+            size = self.__encode_segment(seg, buf)
+            self.output(bytes(buf[:size]), self, self.user)
+        elif self.probe & KCP_ASK_TELL:
+            seg = KCP_SEG(
+                conv=self.conv,
+                cmd=KCP_CMD_WINS,
+                frg=0,
+                wnd=self.__get_available_window(),
+                ts=self.current,
+                sn=0,
+                una=self.rcv_nxt,
+                resendts=0,
+                rto=0,
+                fastack=0,
+                xmit=0,
+                data=b"",
+            )
+            buf = bytearray(self.mtu)
+            size = self.__encode_segment(seg, buf)
+            self.output(bytes(buf[:size]), self, self.user)
+            self.probe = 0
+
     def __get_cwnd(self) -> int:
         """获取拥塞窗口"""
         if self.no_congest_control:
@@ -620,14 +636,20 @@ class KCP:
         return self.rcv_wnd - len(self.rcv_queue)
 
     def __check_probe(self) -> None:
-        """检查是否需要窗口探测"""
+        """检查是否需要窗口探测
+
+        当对端窗口为 0（rmt_wnd==0）时，必须主动发送 WASK 请求窗口更新。
+        首次立即探测，之后按指数退避重试（避免无效的频繁探测）。
+        原实现首次不置位且间隔高达 120 秒，会导致窗口耗尽后发送永久卡死。
+        """
         if self.rmt_wnd == 0:
             if self.probe_wait == 0:
-                self.probe_wait = 0x7fffffff
-                self.ts_probe = self.current + 100
-            if self.current - self.ts_probe >= 0:
-                self.ts_probe = self.current + min(self.probe_wait, 120000)
-                self.probe_wait *= 2
+                self.probe_wait = 1000  # 首次探测间隔(ms)
+                self.probe |= KCP_ASK_SEND
+                self.ts_probe = self.current + self.probe_wait
+            elif self.current - self.ts_probe >= 0:
+                self.probe_wait = min(self.probe_wait * 2, 60000)
+                self.ts_probe = self.current + self.probe_wait
                 self.probe |= KCP_ASK_SEND
 
     def update(self, current: Optional[int] = None) -> int:
@@ -696,7 +718,10 @@ class KCP:
             self.rcv_queue.popleft()
             return seg.data
         
-        # 有多片需要合并
+        # 有多片需要合并：必须确保该消息的全部分片（frg+1 个段）都已到齐，
+        # 否则会返回截断数据（例如最后一片未到却提前 recv）。
+        if len(self.rcv_queue) < seg.frg + 1:
+            return b""
         total = 0
         count = 0
         for s in self.rcv_queue:
@@ -727,6 +752,9 @@ class KCP:
         if seg.frg == 0:
             return len(seg.data)
         
+        # 分片消息：全部片未到齐时返回 -1（不可读），避免读出截断数据
+        if len(self.rcv_queue) < seg.frg + 1:
+            return -1
         total = 0
         for s in self.rcv_queue:
             total += len(s.data)
