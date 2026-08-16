@@ -75,8 +75,8 @@ class IceConfig:
         return cls(
             ice_servers=[
                 TurnServerConfig(
-                    url="stun:stun.l.google.com:19302",
-                    use_cloudflare=False
+                    url="stun:stun.cloudflare.com:3478",
+                    use_cloudflare=True
                 ),
                 TurnServerConfig(
                     url="stun:turn.cloudflare.com:3478",
