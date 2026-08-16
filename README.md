@@ -1,14 +1,14 @@
 # P2P 通信库
 
-基于 **QUIC + KCP + Cloudflare TURN** 的点对点通信工具,支持 NAT 穿透、低延迟传输,并内置游戏隧道功能(可用于 Minecraft 等游戏联机)。
+基于 **KCP + Cloudflare TURN** 的点对点通信工具,支持 NAT 穿透、低延迟传输,并内置游戏隧道功能(可用于 Minecraft 等游戏联机)。
 
 ## 特性
 
-- **多协议传输**:QUIC(基于 aioquic)、KCP(纯 Python 实现)、AUTO(优先 KCP)
+- **统一 KCP 传输**:数据统一走 KCP(纯 Python 实现,fast 模式低延迟),控制信令走 SCTP (DataChannel)
 - **NAT 穿透**:完整 ICE 流程(Host → SRFLX → Relay),Cloudflare TURN 作为中继兜底
 - **WebRTC DataChannel**:基于 aiortc,支持 TURN 中继,跨网络可靠连通
 - **WebSocket 信令**:内置信令服务器与客户端,支持房间管理、自动重连(指数退避)
-- **游戏隧道**:通过 P2P 连接转发 TCP 流量,实现 Minecraft 等游戏联机
+- **游戏隧道**:通过 P2P 连接转发 TCP/UDP 流量,实现 Minecraft 等游戏联机
 - **纯 Python 实现**:KCP 协议无需 C 扩展,跨平台运行
 
 ## 架构
@@ -18,8 +18,8 @@
 │                        P2P 节点 (P2PNode)                    │
 │                                                             │
 │  ┌──────────────┐   ┌──────────────┐   ┌────────────────┐  │
-│  │ SignalingCli │←→ │  IceManager  │←→ │ KCP/QUIC 传输层 │  │
-│  │  (WebSocket) │   │ (aiortc DC)  │   │                │  │
+│  │ SignalingCli │←→ │  IceManager  │←→ │  KCP 传输层     │  │
+│  │  (WebSocket) │   │ (aiortc DC)  │   │ (KCP+SCTP)     │  │
 │  └──────────────┘   └──────┬───────┘   └────────────────┘  │
 │                            │                               │
 │                            ▼                               │
@@ -31,7 +31,7 @@
 **数据流向(游戏隧道)**:
 
 ```
-MC客户端 → localhost:25565 (CLIENT本地TCP) → P2P DataChannel → HOST → localhost:25565 (MC服务端)
+MC客户端 → localhost:25565 (CLIENT本地TCP) → P2P KCP → HOST → localhost:25565 (MC服务端)
 ```
 
 ## 环境要求
@@ -50,7 +50,6 @@ uv sync
 
 | 依赖 | 用途 |
 |------|------|
-| `aioquic` | QUIC 协议实现 |
 | `aiortc` | WebRTC / ICE / DataChannel |
 | `websockets` | 信令服务器 WebSocket |
 | `cryptography` | DTLS 加密 |
@@ -96,8 +95,8 @@ uv run p2p chat test123 --as b
 │                 │                              │                 │
 │  用户客户端      │                              │  目标服务        │
 │     ↓           │                              │     ↑           │
-│  127.0.0.1:PORT │  ←─ P2P DataChannel ──→     │  127.0.0.1:PORT │
-│  (本地监听)      │     (QUIC/KCP+TURN)         │  (转发到服务)    │
+│  127.0.0.1:PORT │  ←─ P2P KCP ──→             │  127.0.0.1:PORT │
+│  (本地监听)      │     (KCP+TURN)              │  (转发到服务)    │
 └─────────────────┘                              └─────────────────┘
 ```
 
@@ -218,8 +217,9 @@ p2p [--log-level LEVEL] <cmd> [options]
 | 选项 | 说明 | 默认值 |
 |------|------|--------|
 | `--as a\|b` | a=initiator(sender), b=responder(receiver) | 必填 |
-| `-t, --transport auto\|kcp\|quic` | 传输协议 | `auto` |
 | `--duration SECONDS`(仅 bench) | A 端发送时长 | `30` |
+
+> 数据统一走 KCP 传输,无需再指定传输协议。
 
 **`server` / `client` 专属:**
 
@@ -243,11 +243,10 @@ uv run p2p-signaling --port 8765 [--host 0.0.0.0]
 
 ```python
 import asyncio
-from p2p import P2PConfig, P2PNode, TransportProtocol, ConnectionRole, IceConfig, MessageType
+from p2p import P2PConfig, P2PNode, ConnectionRole, IceConfig, MessageType
 
 async def main():
     config = P2PConfig(
-        transport=TransportProtocol.AUTO,
         role=ConnectionRole.INITIATOR,
         ice=IceConfig.with_cloudflare_turn(),
     )
@@ -273,7 +272,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from p2p import P2PConfig, TransportProtocol, ConnectionRole, IceConfig
+from p2p import P2PConfig, ConnectionRole, IceConfig
 from p2p.game_tunnel import GameTunnel, TunnelConfig
 
 async def main():
@@ -287,7 +286,6 @@ async def main():
         name="mc-tunnel",
     )
     p2p_config = P2PConfig(
-        transport=TransportProtocol.AUTO,
         role=ConnectionRole.INITIATOR,  # client 端
         ice=IceConfig.with_cloudflare_turn(),
     )
@@ -312,7 +310,7 @@ p2p/
 │   ├── types.py             # 数据类型(Message / PeerInfo / ConnectionState ...)
 │   ├── kcp.py               # KCP 协议纯 Python 实现
 │   ├── kcp_transport.py     # KCP 异步传输层封装
-│   ├── quic_transport.py    # QUIC 传输层封装(基于 aioquic)
+│   ├── hybrid_transport.py  # KCP 传输管理器(数据走 KCP,控制走 SCTP)
 │   ├── ice_manager.py       # ICE / STUN / TURN 管理(基于 aiortc)
 │   ├── signaling_server.py  # WebSocket 信令服务器
 │   ├── signaling_client.py  # 信令客户端(自动重连)
@@ -343,11 +341,11 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 ### node.py
 
-`P2PNode` 整合 ICE、QUIC/KCP 传输、信令,提供统一的消息收发接口。初始化流程:`initialize()` → `connect_to_signaling()` → `join_room()` → `connect_to_peer()`。
+`P2PNode` 整合 ICE、KCP 传输、信令,提供统一的消息收发接口。数据统一通过 KCP 传输。初始化流程:`initialize()` → `connect_to_signaling()` → `join_room()` → `connect_to_peer()`。
 
 ### game_tunnel.py
 
-`GameTunnel` 在 P2P DataChannel 上转发 **TCP / UDP** 流量。CLIENT 端在本地起监听(TCP 用 `asyncio.start_server`,UDP 用 `create_datagram_endpoint`),HOST 端连接本地目标服务,双向转发数据。
+`GameTunnel` 在 P2P KCP 连接上转发 **TCP / UDP** 流量。CLIENT 端在本地起监听(TCP 用 `asyncio.start_server`,UDP 用 `create_datagram_endpoint`),HOST 端连接本地目标服务,双向转发数据。
 
 - TCP:每条连接分配 `conn_id`,通过 `tunnel.tcp.open/data/close` 消息转发,内置 `_tcp_pending` 缓冲解决隧道建立前数据丢失
 - UDP:按客户端源地址分配 `conn_id`,HOST 端为每个会话创建独立 UDP relay,空闲 60 秒自动清理
@@ -357,9 +355,7 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 ### 传输协议
 
-- `auto`(默认):优先使用 KCP,低延迟适合游戏
-- `quic`:基于 aioquic,可靠有序
-- `kcp`:纯 Python 实现,fast 模式低延迟
+统一使用 **KCP**(纯 Python 实现,fast 模式低延迟,适合实时游戏)。控制信令通过 SCTP (DataChannel) 交换,KCP 直连不可用时自动降级到 SCTP。
 
 ### Cloudflare TURN
 

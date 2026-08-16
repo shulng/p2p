@@ -127,7 +127,6 @@ class ConnectionStats:
     ice_state: Optional[str] = None
     local_address: Optional[str] = None
     remote_address: Optional[str] = None
-    quic_stats: Optional[TransportStats] = None
     kcp_stats: Optional[TransportStats] = None
     connected_since: Optional[datetime] = None
 

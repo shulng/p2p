@@ -12,7 +12,6 @@ from .config import (
     ConnectionRole,
     IceConfig,
     P2PConfig,
-    TransportProtocol,
 )
 from .game_tunnel import GameTunnel, TunnelConfig
 from .node import P2PNode
@@ -31,17 +30,8 @@ def _setup_logger(level: str = "INFO") -> None:
     )
 
 
-def _transport_proto(val: str) -> TransportProtocol:
-    return {
-        "quic": TransportProtocol.QUIC,
-        "kcp": TransportProtocol.KCP,
-        "auto": TransportProtocol.AUTO,
-    }[val.lower()]
-
-
-def _base_config(transport: str, role: ConnectionRole, signaling: str) -> P2PConfig:
+def _base_config(role: ConnectionRole, signaling: str) -> P2PConfig:
     cfg = P2PConfig(
-        transport=_transport_proto(transport),
         role=role,
         ice=IceConfig.with_cloudflare_turn(),
     )
@@ -51,9 +41,9 @@ def _base_config(transport: str, role: ConnectionRole, signaling: str) -> P2PCon
 
 # ============== chat ==============
 
-async def _run_chat(signaling: str, room: str, transport: str, as_side: str) -> int:
+async def _run_chat(signaling: str, room: str, as_side: str) -> int:
     role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
-    cfg = _base_config(transport, role, signaling)
+    cfg = _base_config(role, signaling)
 
     if as_side == "a":
         logger.info("=== chat: side A (initiator, 主动发测试消息) ===")
@@ -119,10 +109,10 @@ async def _run_chat(signaling: str, room: str, transport: str, as_side: str) -> 
 
 # ============== bench ==============
 
-async def _run_bench(signaling: str, room: str, transport: str, as_side: str, duration: float) -> int:
+async def _run_bench(signaling: str, room: str, as_side: str, duration: float) -> int:
     role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
-    cfg = _base_config(transport, role, signaling)
-    logger.info(f"=== bench as side {as_side} ({role.value}), transport={transport} ===")
+    cfg = _base_config(role, signaling)
+    logger.info(f"=== bench as side {as_side} ({role.value}), transport=KCP ===")
 
     start_time = None
     total_bytes = 0
@@ -233,7 +223,6 @@ async def _run_tunnel(
             logger.info(f"Listen UDP 127.0.0.1:{udp_port} → P2P")
 
     p2p_cfg = P2PConfig(
-        transport=TransportProtocol.AUTO,
         role=role,
         ice=IceConfig.with_cloudflare_turn(),
     )
@@ -268,7 +257,7 @@ async def _run_tunnel(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="p2p",
-        description="P2P Tunnel (SCTP via DataChannel + Cloudflare TURN)",
+        description="P2P Tunnel (KCP + SCTP via DataChannel + Cloudflare TURN)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -311,8 +300,6 @@ Examples:
                     help="a=initiator(发测试消息), b=responder(回消息)")
     sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING,
                     help=f"信令服务器 (默认: {DEFAULT_SIGNALING})")
-    sp.add_argument("-t", "--transport", choices=["auto", "kcp", "quic"], default="auto",
-                    help="传输协议 (默认: auto)")
 
     # --- bench ---
     sp = sub.add_parser("bench", help="性能测试 (A 发大数据, B 收)")
@@ -320,7 +307,6 @@ Examples:
     sp.add_argument("--as", dest="as_side", choices=["a", "b"], required=True,
                     help="a=sender, b=receiver")
     sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
-    sp.add_argument("-t", "--transport", choices=["auto", "kcp", "quic"], default="auto")
     sp.add_argument("--duration", type=float, default=30.0,
                     help="A 端发送时长（秒，默认 30）")
 
@@ -355,10 +341,10 @@ def main() -> None:
 
     try:
         if args.cmd == "chat":
-            rc = asyncio.run(_run_chat(args.signaling, args.room, args.transport, args.as_side))
+            rc = asyncio.run(_run_chat(args.signaling, args.room, args.as_side))
         elif args.cmd == "bench":
             rc = asyncio.run(
-                _run_bench(args.signaling, args.room, args.transport, args.as_side, args.duration)
+                _run_bench(args.signaling, args.room, args.as_side, args.duration)
             )
         elif args.cmd == "server":
             if not (args.tcp_port or args.udp_port):

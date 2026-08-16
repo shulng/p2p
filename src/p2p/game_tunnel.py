@@ -21,7 +21,7 @@ from loguru import logger
 from .config import P2PConfig, TransportProtocol, ConnectionRole, IceConfig
 from .node import P2PNode
 from .types import Message, MessageType, ConnectionState
-from .hybrid_transport import CHANNEL_CONTROL, CHANNEL_REALTIME
+from .hybrid_transport import CHANNEL_CONTROL, CHANNEL_DATA
 
 
 # 隧道消息类型（复用 Message 结构，payload 为 dict）
@@ -170,13 +170,12 @@ class GameTunnel:
         # 校验端口配置
         self._validate_config()
 
-        # 设置 P2P 节点 (启用混合传输: QUIC/KCP/SCTP 按类型分流)
+        # 设置 P2P 节点 (数据统一走 KCP)
         self._node = P2PNode(
             config=self.p2p_config,
             on_message=self._on_p2p_message,
             on_peer_connected=self._on_peer_connected,
             on_peer_disconnected=self._on_peer_disconnected,
-            enable_hybrid=True,
         )
         await self._node.initialize()
         await self._node.connect_to_signaling()
@@ -513,9 +512,9 @@ class GameTunnel:
     async def _send_tunnel_message(self, tunnel_type: str, conn_id: str, data: bytes) -> None:
         """通过 P2P 发送隧道消息（按 conn_id 路由到对应 peer）
 
-        分流策略（混合传输）:
+        通道策略:
           - 控制消息 (open/close) → CHANNEL_CONTROL (SCTP/DataChannel)
-          - 数据消息 (DATA)       → CHANNEL_REALTIME (KCP 优先, 降级 SCTP)
+          - 数据消息 (DATA)       → CHANNEL_DATA (KCP 优先, 降级 SCTP)
         """
         if not self._node:
             return
@@ -526,7 +525,7 @@ class GameTunnel:
 
         # 按消息类型选择通道
         if tunnel_type in (TUNNEL_TCP_DATA, TUNNEL_UDP_DATA):
-            channel = CHANNEL_REALTIME  # 实时数据 → KCP
+            channel = CHANNEL_DATA  # 数据 → KCP
         else:
             channel = CHANNEL_CONTROL   # 控制信令 → SCTP
 

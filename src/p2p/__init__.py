@@ -1,7 +1,6 @@
-"""P2P 库 - QUIC + KCP + Cloudflare TURN
+"""P2P 库 - KCP + Cloudflare TURN
 
 提供点对点通信能力，支持：
-- QUIC 可靠传输 (基于 aioquic)
 - KCP 可靠 UDP 传输 (纯 Python 实现)
 - ICE/STUN/TURN NAT 穿透 (基于 aiortc)
 - Cloudflare TURN 服务器 (turn.cloudflare.com:3478)
@@ -13,7 +12,6 @@ __version__ = "0.1.0"
 from .config import (
     P2PConfig,
     IceConfig,
-    QuicConfig,
     KcpConfig,
     TurnServerConfig,
     SignalingConfig,
@@ -34,25 +32,22 @@ from .types import (
 )
 from .kcp import KCP
 from .kcp_transport import KCPTransport
-from .quic_transport import QUICTransport
 from .ice_manager import IceManager
 from .signaling_client import SignalingClient, SignalingEvents
 from .signaling_server import SignalingServer
 from .node import P2PNode
 from .game_tunnel import GameTunnel, TunnelConfig
 from .hybrid_transport import (
-    HybridTransport,
-    HybridStats,
+    KCPDataTransport,
+    KcpTransportStats,
     CHANNEL_CONTROL,
-    CHANNEL_REALTIME,
-    CHANNEL_BULK,
+    CHANNEL_DATA,
 )
 
 __all__ = [
     # Config
     "P2PConfig",
     "IceConfig",
-    "QuicConfig",
     "KcpConfig",
     "TurnServerConfig",
     "SignalingConfig",
@@ -72,8 +67,6 @@ __all__ = [
     # KCP
     "KCP",
     "KCPTransport",
-    # QUIC
-    "QUICTransport",
     # ICE
     "IceManager",
     # Signaling
@@ -85,10 +78,9 @@ __all__ = [
     # Game Tunnel
     "GameTunnel",
     "TunnelConfig",
-    # Hybrid Transport
-    "HybridTransport",
-    "HybridStats",
+    # KCP Transport Manager
+    "KCPDataTransport",
+    "KcpTransportStats",
     "CHANNEL_CONTROL",
-    "CHANNEL_REALTIME",
-    "CHANNEL_BULK",
+    "CHANNEL_DATA",
 ]

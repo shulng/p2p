@@ -6,9 +6,7 @@ from enum import Enum
 
 class TransportProtocol(str, Enum):
     """传输协议类型"""
-    QUIC = "quic"
     KCP = "kcp"
-    AUTO = "auto"
 
 
 class ConnectionRole(str, Enum):
@@ -25,22 +23,6 @@ class TurnServerConfig:
     credential: str = ""
     # Cloudflare TURN 特殊配置
     use_cloudflare: bool = True
-
-
-@dataclass
-class QuicConfig:
-    """QUIC 传输配置"""
-    enabled: bool = True
-    host: str = "0.0.0.0"
-    port: int = 0  # 0表示随机端口
-    # 重试和超时设置(秒)
-    idle_timeout: float = 30.0
-    handshake_timeout: float = 10.0
-    # 拥塞控制
-    max_data: int = 10485760  # 10MB
-    max_stream_data: int = 1048576  # 1MB per stream
-    max_streams_bidi: int = 100
-    max_streams_uni: int = 100
 
 
 @dataclass
@@ -107,9 +89,8 @@ class SignalingConfig:
 @dataclass
 class P2PConfig:
     """P2P 主配置"""
-    transport: TransportProtocol = TransportProtocol.AUTO
+    transport: TransportProtocol = TransportProtocol.KCP
     role: ConnectionRole = ConnectionRole.INITIATOR
-    quic: QuicConfig = field(default_factory=QuicConfig)
     kcp: KcpConfig = field(default_factory=KcpConfig)
     ice: IceConfig = field(default_factory=IceConfig.with_cloudflare_turn)
     signaling: SignalingConfig = field(default_factory=SignalingConfig)

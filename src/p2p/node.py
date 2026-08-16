@@ -1,7 +1,7 @@
-"""P2P 节点 - 整合 ICE、QUIC、KCP、信令
+"""P2P 节点 - 整合 ICE、KCP、信令
 
 支持多 Peer 同时连接：每个远端 Peer 拥有独立的 IceManager / RTCPeerConnection，
-通过 peer_id 路由信令、ICE 候选与数据。
+通过 peer_id 路由信令、ICE 候选与数据。数据统一通过 KCP 传输。
 """
 from __future__ import annotations
 
@@ -29,10 +29,8 @@ from .types import (
     generate_peer_id,
 )
 from .ice_manager import IceManager
-from .kcp_transport import KCPTransport
-from .quic_transport import QUICTransport
 from .signaling_client import SignalingClient, SignalingEvents
-from .hybrid_transport import HybridTransport, CHANNEL_CONTROL, CHANNEL_REALTIME, CHANNEL_BULK
+from .hybrid_transport import KCPDataTransport, CHANNEL_DATA
 
 
 class P2PNode:
@@ -45,14 +43,12 @@ class P2PNode:
         on_peer_connected: Optional[Callable[[PeerInfo], None]] = None,
         on_peer_disconnected: Optional[Callable[[str], None]] = None,
         on_state_changed: Optional[Callable[[str, ConnectionState], None]] = None,
-        enable_hybrid: bool = False,
     ):
         self.config = config
         self.peer_id: str = generate_peer_id()
         self.config.signaling.peer_id = self.peer_id
-        # 混合传输 (QUIC/KCP/SCTP 按类型分流)
-        self.enable_hybrid: bool = enable_hybrid
-        self._hybrid: Dict[str, HybridTransport] = {}
+        # KCP 传输 (数据统一走 KCP, 控制走 SCTP)
+        self._kcp_transports: Dict[str, KCPDataTransport] = {}
 
         # 回调
         self.on_message = on_message
@@ -72,8 +68,6 @@ class P2PNode:
         # （TCP 流转发强依赖字节顺序，create_task 并发会导致数据乱序）
         self._peer_msg_queues: Dict[str, "asyncio.Queue[Optional[Message]]"] = {}
         self._peer_msg_workers: Dict[str, asyncio.Task] = {}
-        self._quic: Optional[QUICTransport] = None
-        self._kcp: Optional[KCPTransport] = None
 
         # 连接的 Peer: peer_id -> {transport, state, ...}
         self._peers: Dict[str, Dict[str, Any]] = {}
@@ -82,10 +76,6 @@ class P2PNode:
         self._negotiation_locks: Dict[str, asyncio.Lock] = {}
         # 每 peer 的 answer 等待事件: peer_id -> asyncio.Event
         self._wait_answer_events: Dict[str, asyncio.Event] = {}
-
-        # 本地地址
-        self._kcp_local_addr: Optional[Tuple[str, int]] = None
-        self._quic_local_addr: Optional[Tuple[str, int]] = None
 
     def _set_state(self, state: ConnectionState) -> None:
         if self.state != state:
@@ -341,9 +331,8 @@ class P2PNode:
             logger.warning(f"[P2PNode] DataChannel failed to open with {peer_id}")
             return False
 
-        # 混合传输:初始化 HybridTransport
-        if self.enable_hybrid:
-            await self._init_hybrid(peer_id, ice)
+        # 初始化 KCP 传输
+        await self._init_kcp_transport(peer_id, ice)
 
         peer_data = {
             "peer_id": peer_id,
@@ -374,56 +363,55 @@ class P2PNode:
         logger.info(f"[P2PNode] Successfully connected to peer {peer_id}")
         return True
 
-    # ========== 混合传输 (Hybrid) ==========
+    # ========== KCP 传输 ==========
 
-    async def _init_hybrid(self, peer_id: str, ice: IceManager) -> None:
-        """初始化混合传输:注入 SCTP 回调,RESPONDER 绑定端口,双方交换地址"""
-        hybrid = HybridTransport(
+    async def _init_kcp_transport(self, peer_id: str, ice: IceManager) -> None:
+        """初始化 KCP 传输:注入 SCTP 回调,RESPONDER 绑定端口,双方交换地址"""
+        kcp_transport = KCPDataTransport(
             role=self.config.role,
             kcp_config=self.config.kcp,
-            quic_config=self.config.quic,
         )
         # 注入 SCTP 发送回调（必须同步:DataChannel.send 本身同步,且保证 TCP 字节序）
-        hybrid.on_sctp_ready(lambda data: ice.send_data_sync(data))
-        # 设置数据接收回调:所有通道(CTRL/REALTIME/BULK)收到的都是序列化 Message,
+        kcp_transport.on_sctp_ready(lambda data: ice.send_data_sync(data))
+        # 设置数据接收回调:所有通道(CTRL/DATA)收到的都是序列化 Message,
         # 统一交给 _handle_transport_data 解码并路由到 on_message(per-peer 有序队列)
-        def _on_hybrid_data(data: bytes, channel: str) -> None:
+        def _on_kcp_data(data: bytes, channel: str) -> None:
             self._handle_transport_data(data, self.config.transport, peer_id)
-        hybrid.on_data = _on_hybrid_data
+        kcp_transport.on_data = _on_kcp_data
 
-        self._hybrid[peer_id] = hybrid
+        self._kcp_transports[peer_id] = kcp_transport
 
-        # RESPONDER 先绑定 KCP/QUIC 端口
+        # RESPONDER 先绑定 KCP 端口
         if self.config.role == ConnectionRole.RESPONDER:
-            await hybrid.start_servers()
+            await kcp_transport.start_server()
 
         # 双方通过 SCTP 交换地址
-        await hybrid.exchange_addresses()
+        await kcp_transport.exchange_address()
 
         # 等待地址交换完成(INITIATOR 会自动发起直连)
-        await hybrid.wait_for_addr_exchange(timeout=10.0)
+        await kcp_transport.wait_for_addr_exchange(timeout=10.0)
 
-    def _get_hybrid(self, peer_id: str) -> Optional[HybridTransport]:
-        """获取指定 peer 的混合传输实例"""
-        return self._hybrid.get(peer_id)
+    def _get_kcp_transport(self, peer_id: str) -> Optional[KCPDataTransport]:
+        """获取指定 peer 的 KCP 传输实例"""
+        return self._kcp_transports.get(peer_id)
 
-    async def send_to_peer_hybrid(
-        self, peer_id: str, data: bytes, channel: str = CHANNEL_REALTIME
+    async def send_to_peer_kcp(
+        self, peer_id: str, data: bytes, channel: str = CHANNEL_DATA
     ) -> bool:
-        """通过混合传输发送数据(按通道类型自动选择协议)
+        """通过 KCP 传输发送数据
 
         Args:
             peer_id: 目标 peer
             data: 数据
-            channel: CHANNEL_CONTROL / CHANNEL_REALTIME / CHANNEL_BULK
+            channel: CHANNEL_CONTROL / CHANNEL_DATA
         """
-        hybrid = self._hybrid.get(peer_id)
-        if hybrid:
-            return await hybrid.send(data, channel)
-        # 未启用混合传输 → 走默认 SCTP
+        kcp_transport = self._kcp_transports.get(peer_id)
+        if kcp_transport:
+            return await kcp_transport.send(data, channel)
+        # KCP 传输未就绪 → 走默认 SCTP
         ice = self._ice_managers.get(peer_id)
         if ice:
-            return ice.send_data(data)
+            return await ice.send_data(data)
         return False
 
     async def send_to_peer_channel(
@@ -431,7 +419,7 @@ class P2PNode:
         peer_id: str,
         msg_type: MessageType,
         payload: Any,
-        channel: str = CHANNEL_REALTIME,
+        channel: str = CHANNEL_DATA,
     ) -> bool:
         """序列化 Message 后通过指定通道发送
 
@@ -439,7 +427,7 @@ class P2PNode:
             peer_id: 目标 peer
             msg_type: 消息类型
             payload: 消息负载
-            channel: CHANNEL_CONTROL / CHANNEL_REALTIME / CHANNEL_BULK
+            channel: CHANNEL_CONTROL / CHANNEL_DATA
         """
         msg = Message.create(
             msg_type=msg_type,
@@ -448,7 +436,7 @@ class P2PNode:
             payload=payload,
         )
         data = self._encode_message(msg)
-        return await self.send_to_peer_hybrid(peer_id, data, channel)
+        return await self.send_to_peer_kcp(peer_id, data, channel)
 
     async def _signal_on_peer_joined(self, peer: PeerInfo) -> None:
         """有新 Peer 加入房间"""
@@ -482,13 +470,13 @@ class P2PNode:
                 await ice.close()
             except Exception as e:
                 logger.debug(f"[P2PNode] Error closing IceManager for {peer_id}: {e}")
-        # 清理混合传输
-        hybrid = self._hybrid.pop(peer_id, None)
-        if hybrid:
+        # 清理 KCP 传输
+        kcp_transport = self._kcp_transports.pop(peer_id, None)
+        if kcp_transport:
             try:
-                await hybrid.close()
+                await kcp_transport.close()
             except Exception as e:
-                logger.debug(f"[P2PNode] Error closing HybridTransport for {peer_id}: {e}")
+                logger.debug(f"[P2PNode] Error closing KCPDataTransport for {peer_id}: {e}")
         # 停止消息 worker：发送 None 停止信号（无上限队列不会满）
         queue = self._peer_msg_queues.pop(peer_id, None)
         if queue is not None:
@@ -523,27 +511,12 @@ class P2PNode:
         """信令断开"""
         logger.warning("[P2PNode] Signaling disconnected")
 
-    def _on_kcp_data(self, data: bytes) -> None:
-        """收到 KCP 数据"""
-        self._handle_transport_data(data, TransportProtocol.KCP)
-
-    def _on_kcp_state(self, state: ConnectionState) -> None:
-        """KCP 状态变化"""
-        logger.debug(f"[P2PNode] KCP state: {state}")
-
-    def _on_quic_data(self, data: bytes) -> None:
-        """收到 QUIC 数据"""
-        self._handle_transport_data(data, TransportProtocol.QUIC)
-
-    def _on_quic_state(self, state: ConnectionState) -> None:
-        """QUIC 状态变化"""
-        logger.debug(f"[P2PNode] QUIC state: {state}")
-
     def _on_ice_data(self, peer_id: str, data: bytes) -> None:
         """收到某 peer 的 DataChannel 数据"""
-        if self.enable_hybrid and peer_id in self._hybrid:
-            # 混合传输:先经 HybridTransport 过滤(管理消息 vs 业务数据)
-            self._hybrid[peer_id].on_sctp_data(data)
+        kcp_transport = self._kcp_transports.get(peer_id)
+        if kcp_transport:
+            # 先经 KCPDataTransport 过滤(管理消息 vs 业务数据)
+            kcp_transport.on_sctp_data(data)
         else:
             self._handle_transport_data(data, self.config.transport, peer_id)
 
@@ -727,22 +700,12 @@ class P2PNode:
 
         self._peers.clear()
         self._ice_managers.clear()
-        self._hybrid.clear()
+        self._kcp_transports.clear()
         self._wait_answer_events.clear()
         self._negotiation_locks.clear()
         self._peer_msg_queues.clear()
         self._peer_msg_workers.clear()
 
-        if self._kcp:
-            try:
-                await self._kcp.close()
-            except Exception:
-                pass
-        if self._quic:
-            try:
-                await self._quic.close()
-            except Exception:
-                pass
         if self._signaling:
             await self._signaling.close()
 
