@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import asyncio
-import struct
-import pickle
+import base64
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Any
@@ -531,6 +531,7 @@ class P2PNode:
         关键：同一 peer 的消息必须按到达顺序处理（TCP 字节流强依赖顺序）。
         通过 per-peer 队列 + 单 worker 串行 await，避免 create_task 并发导致乱序。
         """
+        msg: Optional[Message] = None
         try:
             msg = self._decode_message(data)
             logger.debug(
@@ -539,7 +540,6 @@ class P2PNode:
             )
         except Exception:
             # 解码失败：包装成原始二进制消息
-            sender = msg.sender_id if 'msg' in locals() else (peer_id or "unknown")
             msg = Message.create(
                 msg_type=MessageType.DATA_BINARY,
                 sender_id=sender,
@@ -586,34 +586,60 @@ class P2PNode:
             finally:
                 queue.task_done()
 
+    @staticmethod
+    def _encode_payload(payload: Any) -> Any:
+        """递归将 payload 编码为可 JSON 序列化的结构
+
+        - bytes -> {"__bytes__": "<base64>"}（解码时还原为 bytes）
+        - dict / list 递归处理内嵌的 bytes（如隧道消息 {..., "data": b'...'}）
+        - 其余原样返回（str / None / 数值等，须为 JSON 可序列化类型）
+        """
+        if isinstance(payload, bytes):
+            return {"__bytes__": base64.b64encode(payload).decode("ascii")}
+        if isinstance(payload, dict):
+            return {k: P2PNode._encode_payload(v) for k, v in payload.items()}
+        if isinstance(payload, (list, tuple)):
+            return [P2PNode._encode_payload(item) for item in payload]
+        return payload
+
+    @staticmethod
+    def _decode_payload(payload: Any) -> Any:
+        """将 JSON 结构还原为原始 payload"""
+        if isinstance(payload, dict):
+            if len(payload) == 1 and "__bytes__" in payload:
+                return base64.b64decode(payload["__bytes__"])
+            return {k: P2PNode._decode_payload(v) for k, v in payload.items()}
+        if isinstance(payload, list):
+            return [P2PNode._decode_payload(item) for item in payload]
+        return payload
+
     def _encode_message(self, msg: Message) -> bytes:
-        """编码消息为二进制"""
-        header = struct.pack(
-            "!BQQ",  # 先尝试简单编码
-            0,  # 版本
-            0,  # 预留
-            len(msg.payload) if isinstance(msg.payload, bytes) else 0,
-        )
-        # 使用 pickle 简化实现
-        return pickle.dumps({
-            "msg_id": msg.msg_id,
-            "msg_type": msg.msg_type.value,
-            "sender_id": msg.sender_id,
-            "receiver_id": msg.receiver_id,
-            "payload": msg.payload,
-            "timestamp": msg.timestamp.isoformat(),
-            "seq": msg.seq,
-        })
+        """编码消息为 JSON 字节串（替代 pickle，避免反序列化安全风险）
+
+        仅支持 JSON 可序列化的 payload；bytes 通过 base64 内嵌。
+        """
+        return json.dumps(
+            {
+                "msg_id": msg.msg_id,
+                "msg_type": msg.msg_type.value,
+                "sender_id": msg.sender_id,
+                "receiver_id": msg.receiver_id,
+                "payload": self._encode_payload(msg.payload),
+                "timestamp": msg.timestamp.isoformat(),
+                "seq": msg.seq,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
 
     def _decode_message(self, data: bytes) -> Message:
-        """从二进制解码消息"""
-        obj = pickle.loads(data)
+        """从 JSON 字节串解码消息"""
+        obj = json.loads(data.decode("utf-8"))
         return Message(
             msg_id=obj["msg_id"],
             msg_type=MessageType(obj["msg_type"]),
             sender_id=obj["sender_id"],
             receiver_id=obj["receiver_id"],
-            payload=obj["payload"],
+            payload=self._decode_payload(obj["payload"]),
             seq=obj["seq"],
         )
 

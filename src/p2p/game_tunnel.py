@@ -422,7 +422,7 @@ class GameTunnel:
                     transport, protocol = await loop.create_datagram_endpoint(
                         lambda: _UdpRelayProtocol(
                             conn_id=conn_id,
-                            on_datagram=self._on_udp_reay_datagram,
+                            on_datagram=self._on_udp_relay_datagram,
                             on_close=self._on_udp_relay_close,
                         ),
                         remote_addr=(
@@ -444,7 +444,7 @@ class GameTunnel:
             self._bytes_forwarded += len(data)
             relay.transport.sendto(data)
 
-    def _on_udp_reay_datagram(self, conn_id: str, data: bytes) -> None:
+    def _on_udp_relay_datagram(self, conn_id: str, data: bytes) -> None:
         """HOST 端：本地目标服务回包 -> 通过 P2P 转发回 CLIENT"""
         self._bytes_forwarded += len(data)
         asyncio.create_task(self._send_tunnel_message(TUNNEL_UDP_DATA, conn_id, data))

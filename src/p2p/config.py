@@ -61,7 +61,7 @@ class IceConfig:
                     use_cloudflare=True
                 ),
                 TurnServerConfig(
-                    url="stun:turn.cloudflare.com:3478",
+                    url="stun:stun.cloudflare.com:3478",
                     use_cloudflare=True
                 ),
                 TurnServerConfig(

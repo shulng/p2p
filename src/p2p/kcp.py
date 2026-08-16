@@ -450,9 +450,10 @@ class KCP:
         snd_queue_count = len(self.snd_queue)
         
         # 移动发送队列到发送缓冲区
+        # 注意：序号 sn 已在 send() 中按 snd_nxt 分配并自增，这里不可覆盖，
+        # 否则会与 send() 的序号分配逻辑冲突，导致去重/重传判断错乱。
         while self.snd_queue and snd_buf_count < cwnd:
             newseg = self.snd_queue.popleft()
-            newseg.sn = self.snd_una + snd_buf_count  # 这不对，应该在 send 时设置了
             newseg.ts = self.current
             newseg.wnd = self.__get_available_window()
             newseg.una = self.rcv_nxt
