@@ -316,6 +316,7 @@ class GameTunnel:
         except Exception as e:
             logger.error(f"[Tunnel-TCP] Failed to connect to local target #{conn_id}: {e}")
             self._tcp_pending.pop(conn_id, None)
+            self._conn_to_peer.pop(conn_id, None)
             await self._send_tunnel_message(TUNNEL_TCP_CLOSE, conn_id, b"")
 
     async def _forward_tcp_local_to_remote(self, conn_id: str, reader: asyncio.StreamReader) -> None:

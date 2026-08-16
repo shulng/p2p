@@ -187,7 +187,7 @@ class P2PNode:
                 await asyncio.wait_for(answer_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 logger.warning(f"[P2PNode] Timed out waiting for answer from {target_peer_id}")
-                self._wait_answer_events.pop(target_peer_id, None)
+                await self._fail_peer_connection(target_peer_id, "answer timeout")
                 return False
 
             # 4. 等待 ICE 连接
@@ -196,10 +196,14 @@ class P2PNode:
 
             if ice_ok:
                 logger.info(f"[P2PNode] ICE connection established with {target_peer_id}")
-                await self._establish_transports(target_peer_id)
+                ok = await self._establish_transports(target_peer_id)
+                if not ok:
+                    await self._fail_peer_connection(target_peer_id, "transport establishment failed")
+                    return False
                 return True
             else:
                 logger.warning(f"[P2PNode] ICE connection failed with {target_peer_id}")
+                await self._fail_peer_connection(target_peer_id, "ICE failed")
                 return False
 
     async def _signal_on_offer(self, from_peer_id: str, offer: SessionDescription) -> None:
@@ -228,9 +232,12 @@ class P2PNode:
             ice_ok = await ice.wait_for_connection(timeout=30.0)
             if ice_ok:
                 logger.info(f"[P2PNode] ICE connection established (responder) with {from_peer_id}")
-                await self._establish_transports(from_peer_id)
+                ok = await self._establish_transports(from_peer_id)
+                if not ok:
+                    await self._fail_peer_connection(from_peer_id, "transport establishment failed")
             else:
                 logger.warning(f"[P2PNode] ICE connection failed with {from_peer_id}")
+                await self._fail_peer_connection(from_peer_id, "ICE failed")
 
     async def _signal_on_answer(self, from_peer_id: str, answer: SessionDescription) -> None:
         """收到 Answer，路由到对应 peer 的 IceManager"""
@@ -263,17 +270,25 @@ class P2PNode:
             )
 
     def _on_ice_state(self, peer_id: str, state: ConnectionState) -> None:
-        """某 peer 的 ICE 状态变化"""
+        """某 peer 的 ICE 状态变化
+
+        断开/失败时调用 _cleanup_peer 完整清理 IceManager/锁/事件，
+        并通过 was_connected 标志避免与 _signal_on_peer_left 双触发 on_peer_disconnected。
+        """
         ice = self._ice_managers.get(peer_id)
         ice_state = ice.ice_state if ice else "unknown"
         logger.info(f"[P2PNode] ICE state for {peer_id}: {state}, ice_state={ice_state}")
 
         # 连接断开/失败时清理
         if state in (ConnectionState.DISCONNECTED, ConnectionState.FAILED, ConnectionState.CLOSED):
-            if peer_id in self._peers:
-                del self._peers[peer_id]
-                if self.on_peer_disconnected:
-                    self.on_peer_disconnected(peer_id)
+            # _cleanup_peer 是 async，但本回调是 sync；用 create_task 调度
+            asyncio.create_task(self._cleanup_and_notify(peer_id))
+
+    async def _cleanup_and_notify(self, peer_id: str) -> None:
+        """ICE 断开后的清理 + 通知（幂等：仅在 was_connected 时通知一次）"""
+        was_connected = await self._cleanup_peer(peer_id)
+        if was_connected and self.on_peer_disconnected:
+            self.on_peer_disconnected(peer_id)
 
     def _on_ice_gathering_done(self, peer_id: str) -> None:
         """某 peer 的 ICE 候选收集完成"""
@@ -297,12 +312,15 @@ class P2PNode:
         """某 peer 的 ICE 远端地址"""
         logger.info(f"[P2PNode] ICE remote address for {peer_id}: {addr}")
 
-    async def _establish_transports(self, peer_id: str) -> None:
-        """在 ICE 连接成功后建立传输层 (使用 DataChannel)"""
+    async def _establish_transports(self, peer_id: str) -> bool:
+        """在 ICE 连接成功后建立传输层 (使用 DataChannel)
+
+        Returns: True 表示成功建立并已触发 on_peer_connected，False 表示失败（调用方应清理）
+        """
         ice = self._ice_managers.get(peer_id)
         if not ice:
             logger.warning(f"[P2PNode] No IceManager for {peer_id}")
-            return
+            return False
 
         remote_addr = ice.selected_address
 
@@ -312,7 +330,7 @@ class P2PNode:
         dc_ok = await ice.wait_for_data_channel(timeout=15.0)
         if not dc_ok:
             logger.warning(f"[P2PNode] DataChannel failed to open with {peer_id}")
-            return
+            return False
 
         peer_data = {
             "peer_id": peer_id,
@@ -341,6 +359,7 @@ class P2PNode:
             self.on_peer_connected(peer_info)
 
         logger.info(f"[P2PNode] Successfully connected to peer {peer_id}")
+        return True
 
     async def _signal_on_peer_joined(self, peer: PeerInfo) -> None:
         """有新 Peer 加入房间"""
@@ -356,15 +375,16 @@ class P2PNode:
             asyncio.create_task(self.connect_to_peer(peer.peer_id))
 
     async def _signal_on_peer_left(self, peer_id: str) -> None:
-        """Peer 离开"""
+        """Peer 离开房间（幂等：复用 _cleanup_and_notify，与 ICE 断开路径一致）"""
         logger.info(f"[P2PNode] Peer left: {peer_id}")
-        await self._cleanup_peer(peer_id)
-        if self.on_peer_disconnected:
-            self.on_peer_disconnected(peer_id)
+        await self._cleanup_and_notify(peer_id)
 
     async def _cleanup_peer(self, peer_id: str) -> None:
-        """清理指定 peer 的所有资源"""
-        self._peers.pop(peer_id, None)
+        """清理指定 peer 的所有资源（IceManager / 锁 / 事件 / peer 状态）
+
+        幂等：重复调用安全。用于连接失败、ICE 断开、peer 离开等所有清理路径。
+        """
+        was_connected = self._peers.pop(peer_id, None) is not None
         self._wait_answer_events.pop(peer_id, None)
         self._negotiation_locks.pop(peer_id, None)
         ice = self._ice_managers.pop(peer_id, None)
@@ -373,6 +393,12 @@ class P2PNode:
                 await ice.close()
             except Exception as e:
                 logger.debug(f"[P2PNode] Error closing IceManager for {peer_id}: {e}")
+        return was_connected
+
+    async def _fail_peer_connection(self, peer_id: str, reason: str) -> None:
+        """连接失败的统一清理：关闭 IceManager 并清理所有中间状态"""
+        logger.warning(f"[P2PNode] Failing connection with {peer_id}: {reason}")
+        await self._cleanup_peer(peer_id)
 
     def _signal_on_room_info(self, peers: List[PeerInfo]) -> None:
         """房间信息更新"""
