@@ -186,13 +186,17 @@ class GameTunnel:
         await self._peer_connected_event.wait()
 
         if self.role == ConnectionRole.RESPONDER:
-            # HOST 端：无需本地监听，直接接收 P2P 数据转发到本地服务
-            logger.info(
-                f"Ready! Forwarding P2P -> "
-                f"{self.tunnel_config.remote_forward_host}:"
-                f"{self._remote_tcp_port()}"
-                + (f" (udp {self._remote_udp_port()})" if proto in ("udp", "both") else "")
-            )
+            # SERVER 端：无需本地监听，直接接收 P2P 数据转发到本地服务
+            targets = []
+            if proto in ("tcp", "both"):
+                targets.append(
+                    f"TCP {self.tunnel_config.remote_forward_host}:{self._remote_tcp_port()}"
+                )
+            if proto in ("udp", "both"):
+                targets.append(
+                    f"UDP {self.tunnel_config.remote_forward_host}:{self._remote_udp_port()}"
+                )
+            logger.info(f"Ready! Forwarding P2P -> {', '.join(targets)}")
         else:
             # CLIENT 端：启动本地监听
             if proto in ("tcp", "both"):
