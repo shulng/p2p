@@ -150,7 +150,9 @@ class GameTunnel:
 
         # P2P 节点
         self._node: Optional[P2PNode] = None
-        self._peer_id: Optional[str] = None
+        self._peer_id: Optional[str] = None  # 首个连接的 peer（CLIENT 端单 peer 用）
+        self._peer_ids: set = set()  # 所有已连接的 peer（HOST 端多 peer 用）
+        self._conn_to_peer: Dict[str, str] = {}  # conn_id -> peer_id（回包路由）
         self._connected: bool = False
         self._peer_connected_event: asyncio.Event = asyncio.Event()
 
@@ -263,6 +265,9 @@ class GameTunnel:
 
         self._tcp_tunnels[conn_id] = (reader, writer)
         self._connections_count += 1
+        # CLIENT 端：记录该连接对应的目标 peer（用于回包路由）
+        if self._peer_id:
+            self._conn_to_peer[conn_id] = self._peer_id
 
         await self._send_tunnel_message(TUNNEL_TCP_OPEN, conn_id, b"")
 
@@ -351,6 +356,7 @@ class GameTunnel:
         """远端关闭 TCP 隧道"""
         tunnel = self._tcp_tunnels.pop(conn_id, None)
         self._tcp_pending.pop(conn_id, None)
+        self._conn_to_peer.pop(conn_id, None)
         if tunnel and tunnel[1]:
             try:
                 tunnel[1].close()
@@ -382,6 +388,9 @@ class GameTunnel:
             self._udp_client_to_conn[addr] = conn_id
             self._udp_conn_to_client[conn_id] = addr
             self._connections_count += 1
+            # CLIENT 端：记录该会话对应的目标 peer（用于回包路由）
+            if self._peer_id:
+                self._conn_to_peer[conn_id] = self._peer_id
             logger.debug(f"[Tunnel-UDP] New session #{conn_id} from {addr}")
 
         self._bytes_forwarded += len(data)
@@ -479,6 +488,10 @@ class GameTunnel:
         conn_id = msg.payload.get("conn_id", "")
         data = msg.payload.get("data", b"")
 
+        # 记录 conn_id -> 来源 peer（用于回包路由，支持多 CLIENT 连同一 HOST）
+        if tunnel_type in (TUNNEL_TCP_OPEN, TUNNEL_TCP_DATA, TUNNEL_UDP_DATA) and msg.sender_id:
+            self._conn_to_peer[conn_id] = msg.sender_id
+
         if tunnel_type == TUNNEL_TCP_OPEN:
             asyncio.create_task(self._handle_remote_tcp_open(conn_id))
         elif tunnel_type == TUNNEL_TCP_DATA:
@@ -491,11 +504,15 @@ class GameTunnel:
             await self._handle_remote_udp_close(conn_id)
 
     async def _send_tunnel_message(self, tunnel_type: str, conn_id: str, data: bytes) -> None:
-        """通过 P2P 发送隧道消息"""
-        if not self._node or not self._peer_id:
+        """通过 P2P 发送隧道消息（按 conn_id 路由到对应 peer）"""
+        if not self._node:
+            return
+        # 优先用 conn_id 映射的 peer（多 peer 路由），回退到首个 peer（CLIENT 端单 peer）
+        peer_id = self._conn_to_peer.get(conn_id) or self._peer_id
+        if not peer_id:
             return
         await self._node.send_to_peer(
-            self._peer_id,
+            peer_id,
             MessageType.DATA_JSON,
             {
                 "tunnel_type": tunnel_type,
@@ -505,27 +522,44 @@ class GameTunnel:
         )
 
     def _on_peer_connected(self, peer_info) -> None:
-        """P2P 对端连接成功"""
-        self._peer_id = peer_info.peer_id
+        """P2P 对端连接成功（支持多 peer）"""
+        if self._peer_id is None:
+            self._peer_id = peer_info.peer_id  # 首个 peer
+        self._peer_ids.add(peer_info.peer_id)
         self._connected = True
         self._peer_connected_event.set()
-        logger.success(f"[Tunnel] P2P connected to {peer_info.peer_id}")
+        logger.success(
+            f"[Tunnel] P2P connected to {peer_info.peer_id} "
+            f"(total peers: {len(self._peer_ids)})"
+        )
 
     def _on_peer_disconnected(self, peer_id: str) -> None:
-        """P2P 对端断开"""
-        self._connected = False
-        logger.warning(f"[Tunnel] P2P disconnected from {peer_id}")
-        # 关闭所有隧道
-        for conn_id in list(self._tcp_tunnels.keys()):
-            asyncio.create_task(self._handle_remote_tcp_close(conn_id))
-        for conn_id in list(self._udp_relays.keys()):
-            asyncio.create_task(self._handle_remote_udp_close(conn_id))
+        """P2P 对端断开（清理该 peer 相关的隧道与映射）"""
+        self._peer_ids.discard(peer_id)
+        self._connected = len(self._peer_ids) > 0
+        logger.warning(
+            f"[Tunnel] P2P disconnected from {peer_id} "
+            f"(remaining peers: {len(self._peer_ids)})"
+        )
+        # 清理该 peer 的 conn_id -> peer_id 映射，并关闭对应隧道
+        for conn_id, pid in list(self._conn_to_peer.items()):
+            if pid == peer_id:
+                self._conn_to_peer.pop(conn_id, None)
+                asyncio.create_task(self._handle_remote_tcp_close(conn_id))
+                asyncio.create_task(self._handle_remote_udp_close(conn_id))
+        # 兜底：关闭所有 TCP/UDP 隧道（单 peer 场景）
+        if not self._peer_ids:
+            for conn_id in list(self._tcp_tunnels.keys()):
+                asyncio.create_task(self._handle_remote_tcp_close(conn_id))
+            for conn_id in list(self._udp_relays.keys()):
+                asyncio.create_task(self._handle_remote_udp_close(conn_id))
 
     def get_stats(self) -> Dict[str, Any]:
         """获取隧道统计"""
         return {
             "connected": self._connected,
             "peer_id": self._peer_id,
+            "peer_count": len(self._peer_ids),
             "active_tcp": len(self._tcp_tunnels),
             "active_udp": len(self._udp_relays) if self.role == ConnectionRole.RESPONDER else len(self._udp_conn_to_client),
             "total_connections": self._connections_count,
@@ -558,6 +592,8 @@ class GameTunnel:
         self._udp_relays.clear()
         self._udp_client_to_conn.clear()
         self._udp_conn_to_client.clear()
+        self._conn_to_peer.clear()
+        self._peer_ids.clear()
 
         # 关闭 UDP 清理任务
         if self._udp_cleanup_task:

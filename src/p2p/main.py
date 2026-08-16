@@ -313,7 +313,8 @@ async def run_game_tunnel(
             await asyncio.sleep(30)
             stats = tunnel.get_stats()
             logger.info(
-                f"[STATS] TCP: {stats['active_tcp']}, UDP: {stats['active_udp']}, "
+                f"[STATS] Peers: {stats['peer_count']}, "
+                f"TCP: {stats['active_tcp']}, UDP: {stats['active_udp']}, "
                 f"Total: {stats['total_connections']}, "
                 f"Forwarded: {stats['bytes_forwarded_mb']} MB"
             )
