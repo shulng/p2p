@@ -80,24 +80,35 @@ uv run p2p --mode initiator --room test123 --transport auto
 uv run p2p --mode responder --room test123 --transport auto
 ```
 
-### 3. Minecraft 联机
+### 3. 通用隧道(TCP/UDP 转发)
 
-详见下方 [游戏联机教程](#游戏联机教程)。
+详见下方 [通用隧道教程](#通用隧道教程)。
 
-## 游戏联机教程
+## 通用隧道教程
 
-以 **Minecraft Java Edition** 为例,通过 P2P 隧道转发 TCP 25565 端口流量。
+通过 P2P 隧道转发任意 **TCP / UDP** 流量,可用于游戏联机(Minecraft、泰拉瑞亚、饥荒等)、服务代理、SSH 转发等场景。不绑定任何游戏预设,完全由参数指定协议与端口。
+
+### 工作原理
+
+```
+┌─────────────────┐                              ┌─────────────────┐
+│  CLIENT 端       │                              │  HOST 端         │
+│                 │                              │                 │
+│  用户客户端      │                              │  目标服务        │
+│     ↓           │                              │     ↑           │
+│  127.0.0.1:PORT │  ←─ P2P DataChannel ──→     │  127.0.0.1:PORT │
+│  (本地监听)      │     (QUIC/KCP+TURN)         │  (转发到服务)    │
+└─────────────────┘                              └─────────────────┘
+```
 
 ### 角色说明
 
 | 角色 | CLI 参数 | 含义 | 本地行为 |
 |------|----------|------|----------|
-| **HOST** | `--role host` | 运行 MC 服务端的人(RESPONDER) | 接收 P2P 数据,转发到本地 MC 服务端 |
-| **CLIENT** | `--role client` | 运行 MC 客户端的人(INITIATOR) | 本地起 TCP 监听,MC 客户端连这里 |
+| **HOST** | `--role host` | 运行目标服务端的人(RESPONDER) | 接收 P2P 数据,转发到本地目标服务 |
+| **CLIENT** | `--role client` | 运行用户客户端的人(INITIATOR) | 本地起监听,用户客户端连这里 |
 
 ### 操作步骤
-
-**前提**:HOST 玩家先启动 Minecraft 服务端(默认监听 `127.0.0.1:25565`)。
 
 **终端 1 — 信令服务器**(可在任意机器运行,或部署到公网):
 
@@ -105,53 +116,88 @@ uv run p2p --mode responder --room test123 --transport auto
 uv run p2p-signaling --port 8765
 ```
 
-**终端 2 — HOST 端**(运行 MC 服务端的人):
+**终端 2 — HOST 端**(运行目标服务的人):
 
 ```bash
-uv run p2p --mode game --game mc-java --role host \
-  --room mc-room-001 \
+uv run p2p --mode game --role host \
+  --protocol tcp \
+  --remote-port 25565 \
+  --room my-room \
   --signaling ws://<信令服务器IP>:8765
 ```
 
-**终端 3 — CLIENT 端**(运行 MC 客户端的人):
+**终端 3 — CLIENT 端**(运行用户客户端的人):
 
 ```bash
-uv run p2p --mode game --game mc-java --role client \
-  --room mc-room-001 \
+uv run p2p --mode game --role client \
+  --protocol tcp \
+  --local-port 25565 \
+  --room my-room \
   --signaling ws://<信令服务器IP>:8765
 ```
 
-**最后**:打开 Minecraft Java 版 → 多人游戏 → 直接连接 → 输入 `127.0.0.1` → 进入服务器。
+**最后**:用户客户端连接 `127.0.0.1:25565` 即可(等于直连 HOST 的目标服务)。
+
+### 协议选择
+
+| `--protocol` | 用途 | 示例游戏/服务 |
+|--------------|------|---------------|
+| `tcp`(默认) | TCP 流量转发 | Minecraft Java(25565)、泰拉瑞亚(7777)、SSH(22) |
+| `udp` | UDP 数据包转发 | Minecraft 基岩版(19132)、饥荒联机版(10999) |
+| `both` | 同时转发 TCP + UDP | 需要双协议的服务,端口可不同 |
+
+### 常见场景示例
+
+**Minecraft Java 版(TCP 25565)**:
+
+```bash
+# HOST (运行 MC 服务端)
+uv run p2p --mode game --role host --protocol tcp --remote-port 25565 --room mc-room
+
+# CLIENT (运行 MC 客户端)
+uv run p2p --mode game --role client --protocol tcp --local-port 25565 --room mc-room
+# MC 客户端连接 127.0.0.1:25565
+```
+
+**Minecraft 基岩版(UDP 19132)**:
+
+```bash
+# HOST
+uv run p2p --mode game --role host --protocol udp --remote-port 19132 --room mc-bedrock
+
+# CLIENT
+uv run p2p --mode game --role client --protocol udp --local-port 19132 --room mc-bedrock
+# MC 基岩版客户端连接 127.0.0.1:19132
+```
+
+**同时转发 TCP + UDP(端口不同)**:
+
+```bash
+# HOST: TCP 25565 + UDP 19132
+uv run p2p --mode game --role host --protocol both \
+  --remote-port 25565 --remote-port-udp 19132 --room both-room
+
+# CLIENT: TCP 25565 + UDP 19132
+uv run p2p --mode game --role client --protocol both \
+  --local-port 25565 --local-port-udp 19132 --room both-room
+```
 
 ### 端口冲突处理
 
-如果 CLIENT 端本机 25565 被占用(例如本机也跑了 MC 服务端),改用其他端口:
+如果 CLIENT 端本机端口被占用,改用其他端口:
 
 ```bash
-uv run p2p --mode game --game mc-java --role client \
-  --room mc-room-001 --local-port 35565
+uv run p2p --mode game --role client --protocol tcp \
+  --local-port 35565 --room mc-room
+# 客户端连接 127.0.0.1:35565
 ```
 
-然后 MC 客户端连接 `127.0.0.1:35565`。
-
-如果 HOST 端 MC 服务端端口非默认(在 `server.properties` 中改过),用 `--remote-port` 指定:
+如果 HOST 端目标服务端口非默认,用 `--remote-port` 指定:
 
 ```bash
-uv run p2p --mode game --game mc-java --role host \
-  --room mc-room-001 --remote-port 25566
+uv run p2p --mode game --role host --protocol tcp \
+  --remote-port 25566 --room mc-room
 ```
-
-### 支持的游戏预设
-
-| 预设 | 游戏 | 协议 | 默认端口 |
-|------|------|------|----------|
-| `mc-java` | Minecraft Java Edition | TCP | 25565 |
-| `mc-bedrock` | Minecraft Bedrock Edition | UDP | 19132 |
-| `terraria` | 泰拉瑞亚 | TCP | 7777 |
-| `dont-starve` | 饥荒联机版 | UDP | 10999 |
-| `custom` | 自定义 | TCP | 25565 |
-
-> **注意**:`mc-bedrock` 和 `dont-starve` 为 UDP 协议,当前 `GameTunnel` 仅实现了 TCP 转发,UDP 游戏需补充 UDP 转发逻辑后才能使用。
 
 ## CLI 参数
 
@@ -163,10 +209,13 @@ uv run p2p --mode game --game mc-java --role host \
 | `--transport` | 传输协议:`quic` / `kcp` / `auto` | `auto` |
 | `--signaling` | 信令服务器地址 | `ws://localhost:8765` |
 | `--room` | 房间 ID | `default-room` |
-| `--role` | 角色:`initiator` / `responder`(通信)或 `host` / `client`(游戏) | - |
-| `--game` | 游戏预设(仅 game 模式) | `mc-java` |
-| `--local-port` | 本地监听端口(仅 client 端) | 游戏默认端口 |
-| `--remote-port` | 远端转发端口(仅 host 端) | 游戏默认端口 |
+| `--role` | 角色:`initiator` / `responder`(通信)或 `host` / `client`(隧道) | - |
+| `--protocol` | 隧道协议:`tcp` / `udp` / `both`(仅 game 模式) | `tcp` |
+| `--local-port` | CLIENT 端本地监听端口(TCP,或 UDP 未单独指定时) | - |
+| `--remote-port` | HOST 端远端转发端口(TCP,或 UDP 未单独指定时) | - |
+| `--local-port-udp` | CLIENT 端本地 UDP 监听端口(仅 both/udp 模式) | 同 `--local-port` |
+| `--remote-port-udp` | HOST 端远端 UDP 转发端口(仅 both/udp 模式) | 同 `--remote-port` |
+| `--name` | 隧道名称(仅日志显示) | `tunnel` |
 | `--log-level` | 日志级别:`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
 
 ### `p2p-signaling` 命令
@@ -207,15 +256,23 @@ async def main():
 asyncio.run(main())
 ```
 
-游戏隧道编程式使用:
+通用隧道编程式使用:
 
 ```python
 import asyncio
 from p2p import P2PConfig, TransportProtocol, ConnectionRole, IceConfig
-from p2p.game_tunnel import GameTunnel, GAME_PRESETS
+from p2p.game_tunnel import GameTunnel, TunnelConfig
 
 async def main():
-    tunnel_config = GAME_PRESETS["mc-java"]
+    # 通用配置：协议、端口、目标都由参数指定
+    tunnel_config = TunnelConfig(
+        protocol="both",           # tcp / udp / both
+        local_listen_port=25565,   # CLIENT 端本地 TCP 监听
+        remote_forward_port=25565, # HOST 端转发目标 TCP 端口
+        local_listen_port_udp=19132,
+        remote_forward_port_udp=19132,
+        name="mc-tunnel",
+    )
     p2p_config = P2PConfig(
         transport=TransportProtocol.AUTO,
         role=ConnectionRole.INITIATOR,  # client 端
@@ -224,7 +281,7 @@ async def main():
     p2p_config.signaling.server_url = "ws://localhost:8765"
 
     tunnel = GameTunnel(p2p_config, tunnel_config, ConnectionRole.INITIATOR)
-    await tunnel.start("ws://localhost:8765", "mc-room-001")
+    await tunnel.start("ws://localhost:8765", "my-room")
 
     while True:
         await asyncio.sleep(1)
@@ -247,7 +304,7 @@ p2p/
 │   ├── signaling_server.py  # WebSocket 信令服务器
 │   ├── signaling_client.py  # 信令客户端(自动重连)
 │   ├── node.py              # P2P 节点(整合所有模块)
-│   ├── game_tunnel.py       # 游戏隧道(TCP 流量转发)
+│   ├── game_tunnel.py       # 通用隧道(TCP/UDP 流量转发)
 │   └── main.py              # CLI 入口
 ├── pyproject.toml
 └── README.md
@@ -277,7 +334,11 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 ### game_tunnel.py
 
-`GameTunnel` 在 P2P DataChannel 上转发 TCP 流量。CLIENT 端在本地起 TCP 监听,HOST 端连接本地 MC 服务端,双向转发数据。内置 `_pending_data` 缓冲机制,解决隧道建立前数据丢失问题。
+`GameTunnel` 在 P2P DataChannel 上转发 **TCP / UDP** 流量。CLIENT 端在本地起监听(TCP 用 `asyncio.start_server`,UDP 用 `create_datagram_endpoint`),HOST 端连接本地目标服务,双向转发数据。
+
+- TCP:每条连接分配 `conn_id`,通过 `tunnel.tcp.open/data/close` 消息转发,内置 `_tcp_pending` 缓冲解决隧道建立前数据丢失
+- UDP:按客户端源地址分配 `conn_id`,HOST 端为每个会话创建独立 UDP relay,空闲 60 秒自动清理
+- `both` 模式:同时启动 TCP 和 UDP 转发,端口可独立配置(`local_listen_port_udp` / `remote_forward_port_udp`)
 
 ## 配置说明
 

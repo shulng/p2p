@@ -16,7 +16,7 @@ from .config import (
 )
 from .node import P2PNode
 from .types import Message, MessageType, PeerInfo, ConnectionState
-from .game_tunnel import GameTunnel, TunnelConfig, GAME_PRESETS
+from .game_tunnel import GameTunnel, TunnelConfig
 
 
 async def run_initiator(
@@ -281,21 +281,22 @@ async def run_game_tunnel(
     signaling_url: str,
     room_id: str,
     role: ConnectionRole,
-    game: str,
+    protocol: str,
     local_port: Optional[int],
     remote_port: Optional[int],
+    local_port_udp: Optional[int],
+    remote_port_udp: Optional[int],
+    name: str,
 ):
-    """游戏隧道模式 - 用于 Minecraft 等游戏联机"""
-    # 获取游戏预设配置
-    tunnel_config = GAME_PRESETS.get(game, GAME_PRESETS["custom"]).__class__(
-        **GAME_PRESETS.get(game, GAME_PRESETS["custom"]).__dict__
+    """通用隧道模式 - 转发任意 TCP/UDP 流量（游戏联机、服务代理等）"""
+    tunnel_config = TunnelConfig(
+        protocol=protocol,
+        local_listen_port=local_port or 0,
+        remote_forward_port=remote_port or 0,
+        local_listen_port_udp=local_port_udp,
+        remote_forward_port_udp=remote_port_udp,
+        name=name,
     )
-
-    # 覆盖自定义端口
-    if local_port:
-        tunnel_config.local_listen_port = local_port
-    if remote_port:
-        tunnel_config.remote_forward_port = remote_port
 
     p2p_config = P2PConfig(
         transport=TransportProtocol.AUTO,
@@ -312,7 +313,7 @@ async def run_game_tunnel(
             await asyncio.sleep(30)
             stats = tunnel.get_stats()
             logger.info(
-                f"[STATS] Active tunnels: {stats['active_tunnels']}, "
+                f"[STATS] TCP: {stats['active_tcp']}, UDP: {stats['active_udp']}, "
                 f"Total: {stats['total_connections']}, "
                 f"Forwarded: {stats['bytes_forwarded_mb']} MB"
             )
@@ -346,16 +347,20 @@ Examples:
   $ p2p --mode initiator --room test123 --transport auto
   $ p2p --mode responder --room test123 --transport auto
 
-  # 3. Minecraft 联机 (Java Edition, TCP 25565)
-  #    HOST 端 (运行 MC 服务端的人):
-  $ p2p --mode game --game mc-java --role host --room mc-room-001
-  #    CLIENT 端 (运行 MC 客户端的人):
-  $ p2p --mode game --game mc-java --role client --room mc-room-001
-  #    然后 MC 客户端连接 -> 127.0.0.1:25565
+  # 3. 通用 TCP 隧道 (如 Minecraft Java, Terraria, SSH)
+  #    HOST 端 (运行目标服务的人):
+  $ p2p --mode game --role host --room my-room --protocol tcp --remote-port 25565
+  #    CLIENT 端 (运行客户端的人):
+  $ p2p --mode game --role client --room my-room --protocol tcp --local-port 25565
+  #    然后客户端连接 -> 127.0.0.1:25565
 
-  # 4. 自定义端口
-  $ p2p --mode game --game custom --role host --room my-room --remote-port 25566
-  $ p2p --mode game --game custom --role client --room my-room --local-port 25566
+  # 4. UDP 隧道 (如 Minecraft Bedrock, 饥荒联机版)
+  $ p2p --mode game --role host --room my-room --protocol udp --remote-port 19132
+  $ p2p --mode game --role client --room my-room --protocol udp --local-port 19132
+
+  # 5. 同时转发 TCP + UDP (端口可不同)
+  $ p2p --mode game --role host --room my-room --protocol both --remote-port 25565 --remote-port-udp 19132
+  $ p2p --mode game --role client --room my-room --protocol both --local-port 25565 --local-port-udp 19132
 
   # 性能测试
   $ p2p --mode benchmark --role initiator --room bench1
@@ -397,24 +402,41 @@ Examples:
         default="INFO",
         help="日志级别",
     )
-    # 游戏模式参数
+    # 隧道模式参数
     parser.add_argument(
-        "--game",
-        choices=list(GAME_PRESETS.keys()),
-        default="mc-java",
-        help="游戏预设: mc-java|mc-bedrock|terraria|dont-starve|custom (默认: mc-java)",
+        "--protocol",
+        choices=["tcp", "udp", "both"],
+        default="tcp",
+        help="隧道协议: tcp|udp|both (默认: tcp)",
     )
     parser.add_argument(
         "--local-port",
         type=int,
         default=None,
-        help="本地监听端口 (client 端, MC客户端连接此端口)",
+        help="CLIENT 端本地监听端口 (TCP，或 UDP 未单独指定时)",
     )
     parser.add_argument(
         "--remote-port",
         type=int,
         default=None,
-        help="远端转发端口 (host 端, MC服务端运行的端口)",
+        help="HOST 端远端转发端口 (TCP，或 UDP 未单独指定时)",
+    )
+    parser.add_argument(
+        "--local-port-udp",
+        type=int,
+        default=None,
+        help="CLIENT 端本地 UDP 监听端口 (仅 both/udp 模式，默认与 --local-port 相同)",
+    )
+    parser.add_argument(
+        "--remote-port-udp",
+        type=int,
+        default=None,
+        help="HOST 端远端 UDP 转发端口 (仅 both/udp 模式，默认与 --remote-port 相同)",
+    )
+    parser.add_argument(
+        "--name",
+        default="tunnel",
+        help="隧道名称 (仅用于日志显示)",
     )
     
     args = parser.parse_args()
@@ -457,7 +479,7 @@ Examples:
             )
         elif args.mode == "game":
             if not args.role or args.role not in ("host", "client"):
-                logger.error("Game mode requires --role host or --role client")
+                logger.error("Tunnel mode requires --role host or --role client")
                 rc = 1
             else:
                 role = role_map[args.role]
@@ -466,9 +488,12 @@ Examples:
                         args.signaling,
                         args.room,
                         role,
-                        args.game,
+                        args.protocol,
                         args.local_port,
                         args.remote_port,
+                        args.local_port_udp,
+                        args.remote_port_udp,
+                        args.name,
                     )
                 )
         else:
