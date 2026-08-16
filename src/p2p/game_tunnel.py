@@ -212,23 +212,23 @@ class GameTunnel:
         logger.info("=== Tunnel Active ===")
 
     def _validate_config(self) -> None:
-        """校验配置"""
+        """校验配置（错误信息对齐 CLI 子命令 server/client 的 --tcp/--udp 参数名）"""
         proto = self.tunnel_config.protocol.lower()
         if proto not in ("tcp", "udp", "both"):
             raise ValueError(f"Invalid protocol: {self.tunnel_config.protocol}")
 
         if self.role == ConnectionRole.RESPONDER:
-            # HOST 端需要 remote 端口
+            # SERVER 端需要目标端口
             if proto in ("tcp", "both") and not self.tunnel_config.remote_forward_port:
-                raise ValueError("HOST requires --remote-port for TCP")
+                raise ValueError("SERVER 需要 --tcp PORT 指定 TCP 目标端口")
             if proto in ("udp", "both") and not self._remote_udp_port():
-                raise ValueError("HOST requires --remote-port (or --remote-port-udp) for UDP")
+                raise ValueError("SERVER 需要 --udp PORT 指定 UDP 目标端口")
         else:
-            # CLIENT 端需要 local 端口
+            # CLIENT 端需要本地监听端口
             if proto in ("tcp", "both") and not self.tunnel_config.local_listen_port:
-                raise ValueError("CLIENT requires --local-port for TCP")
+                raise ValueError("CLIENT 需要 --tcp PORT 指定本地 TCP 监听端口")
             if proto in ("udp", "both") and not self._local_udp_port():
-                raise ValueError("CLIENT requires --local-port (or --local-port-udp) for UDP")
+                raise ValueError("CLIENT 需要 --udp PORT 指定本地 UDP 监听端口")
 
     def _local_udp_port(self) -> int:
         return self.tunnel_config.local_listen_port_udp or self.tunnel_config.local_listen_port

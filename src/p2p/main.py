@@ -1,329 +1,258 @@
-"""P2P 主程序入口 - 提供 CLI 示例"""
+"""P2P 主程序入口 - 子命令 CLI"""
 from __future__ import annotations
 
-import asyncio
 import argparse
-import sys
+import asyncio
 import signal
+import sys
 from typing import Optional
 from loguru import logger
 
 from .config import (
-    P2PConfig,
-    TransportProtocol,
     ConnectionRole,
     IceConfig,
+    P2PConfig,
+    TransportProtocol,
 )
-from .node import P2PNode
-from .types import Message, MessageType, PeerInfo, ConnectionState
 from .game_tunnel import GameTunnel, TunnelConfig
+from .node import P2PNode
+from .types import ConnectionState, Message, MessageType
 
 
-async def run_initiator(
-    signaling_url: str,
-    room_id: str,
-    transport: TransportProtocol,
-):
-    """作为发起方运行"""
-    logger.info("=== Running as INITIATOR ===")
-    
-    config = P2PConfig(
-        transport=transport,
-        role=ConnectionRole.INITIATOR,
+DEFAULT_SIGNALING = "ws://localhost:8765"
+
+
+def _setup_logger(level: str = "INFO") -> None:
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level=level,
+        format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+    )
+
+
+def _transport_proto(val: str) -> TransportProtocol:
+    return {
+        "quic": TransportProtocol.QUIC,
+        "kcp": TransportProtocol.KCP,
+        "auto": TransportProtocol.AUTO,
+    }[val.lower()]
+
+
+def _base_config(transport: str, role: ConnectionRole, signaling: str) -> P2PConfig:
+    cfg = P2PConfig(
+        transport=_transport_proto(transport),
+        role=role,
         ice=IceConfig.with_cloudflare_turn(),
     )
-    config.signaling.server_url = signaling_url
-    
-    node = P2PNode(
-        config=config,
-        on_message=lambda msg: logger.info(
-            f"[MSG] {msg.msg_type.value}: {msg.payload}"
-        ),
-        on_peer_connected=lambda peer: logger.success(
-            f"[CONNECTED] Peer {peer.peer_id} @ {peer.address}:{peer.port}"
-        ),
-        on_peer_disconnected=lambda pid: logger.warning(
-            f"[DISCONNECTED] Peer {pid}"
-        ),
-        on_state_changed=lambda pid, state: logger.info(
-            f"[STATE] {pid}: {state.value}"
-        ),
-    )
-    
-    await node.initialize()
-    
-    if not await node.connect_to_signaling():
-        logger.error("Failed to connect to signaling server")
-        return 1
-    
-    if not await node.join_room(room_id, ConnectionRole.INITIATOR):
-        logger.error("Failed to join room")
-        return 1
-    
-    logger.info("Waiting for responder to join...")
-    logger.info("Tip: Start another instance with --role responder in the same room")
-    
-    # 等待连接
-    try:
-        while not node.get_connected_peers():
-            await asyncio.sleep(1.0)
-        
-        # 连接成功，开始发送测试消息
-        peer_id = node.get_connected_peers()[0]
-        logger.success(f"Connected! Will send test messages to {peer_id}")
-        
-        seq = 0
-        try:
-            while True:
-                seq += 1
-                text_msg = f"Hello from initiator! seq={seq}"
-                await node.send_text(peer_id, text_msg)
-                logger.info(f"Sent: {text_msg}")
-                await asyncio.sleep(2.0)
-        except KeyboardInterrupt:
-            pass
-            
-    finally:
-        await node.close()
-    
-    return 0
+    cfg.signaling.server_url = signaling
+    return cfg
 
 
-async def run_responder(
-    signaling_url: str,
-    room_id: str,
-    transport: TransportProtocol,
-):
-    """作为响应方运行"""
-    logger.info("=== Running as RESPONDER ===")
-    
-    config = P2PConfig(
-        transport=transport,
-        role=ConnectionRole.RESPONDER,
-        ice=IceConfig.with_cloudflare_turn(),
-    )
-    config.signaling.server_url = signaling_url
-    
-    received_count = 0
-    
+# ============== chat ==============
+
+async def _run_chat(signaling: str, room: str, transport: str, as_side: str) -> int:
+    role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
+    cfg = _base_config(transport, role, signaling)
+
+    if as_side == "a":
+        logger.info("=== chat: side A (initiator, 主动发测试消息) ===")
+    else:
+        logger.info("=== chat: side B (responder, 回显) ===")
+
+    recv_seq = 0
+
     def on_message(msg: Message):
-        nonlocal received_count
-        received_count += 1
+        nonlocal recv_seq
+        recv_seq += 1
         if msg.msg_type == MessageType.DATA_TEXT:
-            logger.info(
-                f"[RECV #{received_count}] {msg.sender_id}: {msg.payload}"
-            )
-        elif msg.msg_type == MessageType.DATA_JSON:
-            logger.info(
-                f"[RECV JSON #{received_count}] {msg.payload}"
-            )
+            logger.info(f"[recv #{recv_seq}] {msg.sender_id}: {msg.payload}")
         else:
             logger.info(
-                f"[RECV {msg.msg_type.value} #{received_count}] len={len(msg.payload) if msg.payload else 0}"
+                f"[recv {msg.msg_type.value} #{recv_seq}] len={len(msg.payload) if isinstance(msg.payload, bytes) else 0}B"
             )
-    
+
     node = P2PNode(
-        config=config,
+        config=cfg,
         on_message=on_message,
         on_peer_connected=lambda peer: logger.success(
             f"[CONNECTED] Peer {peer.peer_id} @ {peer.address}:{peer.port}"
         ),
-        on_peer_disconnected=lambda pid: logger.warning(
-            f"[DISCONNECTED] Peer {pid}"
-        ),
+        on_peer_disconnected=lambda pid: logger.warning(f"[DISCONNECTED] Peer {pid}"),
+        on_state_changed=lambda pid, state: logger.info(f"[STATE] {pid}: {state.value}"),
     )
-    
+
     await node.initialize()
-    
     if not await node.connect_to_signaling():
-        logger.error("Failed to connect to signaling server")
+        logger.error("Failed to connect signaling")
         return 1
-    
-    if not await node.join_room(room_id, ConnectionRole.RESPONDER):
+    if not await node.join_room(room, role):
         logger.error("Failed to join room")
         return 1
-    
-    logger.info("Waiting for initiator connection...")
-    
+
     try:
-        # 等待连接
         while not node.get_connected_peers():
-            await asyncio.sleep(1.0)
-        
+            await asyncio.sleep(0.5)
         peer_id = node.get_connected_peers()[0]
-        logger.success(f"Initiator {peer_id} connected!")
-        
-        # 回消息
-        seq = 0
-        try:
+        logger.success(f"Connected to {peer_id}")
+
+        if as_side == "a":
+            seq = 0
             while True:
                 seq += 1
+                await node.send_text(peer_id, f"hello seq={seq}")
+                logger.info(f"sent hello seq={seq}")
+                await asyncio.sleep(2.0)
+        else:
+            seq = 0
+            while True:
                 await asyncio.sleep(3.0)
                 if peer_id in node.get_connected_peers():
-                    await node.send_text(peer_id, f"Echo from responder seq={seq}")
-        except KeyboardInterrupt:
-            pass
-            
+                    seq += 1
+                    await node.send_text(peer_id, f"reply seq={seq}")
+    except KeyboardInterrupt:
+        pass
     finally:
         await node.close()
-    
     return 0
 
 
-async def run_benchmark(
-    signaling_url: str,
-    room_id: str,
-    role: ConnectionRole,
-    transport: TransportProtocol,
-):
-    """性能测试模式"""
-    logger.info(f"=== Running BENCHMARK as {role.value} ===")
-    
-    config = P2PConfig(
-        transport=transport,
-        role=role,
-        ice=IceConfig.with_cloudflare_turn(),
-    )
-    config.signaling.server_url = signaling_url
-    
+# ============== bench ==============
+
+async def _run_bench(signaling: str, room: str, transport: str, as_side: str, duration: float) -> int:
+    role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
+    cfg = _base_config(transport, role, signaling)
+    logger.info(f"=== bench as side {as_side} ({role.value}), transport={transport} ===")
+
     start_time = None
     total_bytes = 0
     msg_count = 0
-    
+
     def on_message(msg: Message):
         nonlocal total_bytes, msg_count, start_time
         if start_time is None:
             start_time = asyncio.get_event_loop().time()
-        
         if isinstance(msg.payload, bytes):
             total_bytes += len(msg.payload)
         else:
             import pickle
             total_bytes += len(pickle.dumps(msg.payload))
         msg_count += 1
-        
         elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed > 0:
-            speed = total_bytes / elapsed / 1024 / 1024
+        if elapsed > 0 and msg_count % 100 == 0:
             logger.info(
-                f"[BENCH] Received {msg_count} msgs, "
+                f"[BENCH] {msg_count} msgs, "
                 f"{total_bytes/1024/1024:.2f} MB, "
-                f"{speed:.2f} MB/s"
+                f"{total_bytes/elapsed/1024/1024:.2f} MB/s"
             )
-    
-    node = P2PNode(
-        config=config,
-        on_message=on_message,
-    )
-    
+
+    node = P2PNode(config=cfg, on_message=on_message)
     await node.initialize()
     await node.connect_to_signaling()
-    await node.join_room(room_id, role)
-    
-    logger.info("Waiting for peer connection...")
+    await node.join_room(room, role)
+
+    logger.info("Waiting for peer...")
     while not node.get_connected_peers():
-        await asyncio.sleep(0.5)
-    
+        await asyncio.sleep(0.3)
     peer_id = node.get_connected_peers()[0]
     logger.success(f"Connected to {peer_id}")
-    
-    if role == ConnectionRole.INITIATOR:
-        # 发送方：发送大量数据
-        data_size = 64 * 1024  # 64KB per message
-        data = b"X" * data_size
-        
+
+    if as_side == "a":
+        chunk = b"X" * (64 * 1024)
         start_time = asyncio.get_event_loop().time()
-        count = 0
-        total_sent = 0
-        
+        sent_count = 0
         try:
-            duration = 30.0  # 30秒测试
             while asyncio.get_event_loop().time() - start_time < duration:
-                await node.send_bytes(peer_id, data)
-                count += 1
-                total_sent += data_size
-                
-                if count % 100 == 0:
-                    elapsed = asyncio.get_event_loop().time() - start_time
-                    speed = total_sent / elapsed / 1024 / 1024
-                    logger.info(
-                        f"[BENCH] Sent {count} msgs, "
-                        f"{total_sent/1024/1024:.2f} MB, "
-                        f"{speed:.2f} MB/s"
-                    )
-                    
+                await node.send_bytes(peer_id, chunk)
+                sent_count += 1
         except KeyboardInterrupt:
             pass
-        
         elapsed = asyncio.get_event_loop().time() - start_time
+        total_sent = sent_count * len(chunk)
         logger.success(
-            f"[BENCH FINAL] Sent {count} msgs, "
+            f"[BENCH SENT] {sent_count} msgs, "
             f"{total_sent/1024/1024:.2f} MB in {elapsed:.1f}s, "
-            f"avg {total_sent/elapsed/1024/1024:.2f} MB/s"
+            f"{total_sent/elapsed/1024/1024:.2f} MB/s"
         )
-        
-        await asyncio.sleep(2.0)  # 等待对方接收完毕
-    
+        await asyncio.sleep(2.0)
     else:
-        # 接收方：持续等待
-        logger.info("Receiving benchmark data... (Ctrl+C to stop)")
+        logger.info("Receiving... (Ctrl+C to stop)")
         try:
             while True:
                 await asyncio.sleep(1.0)
         except KeyboardInterrupt:
             pass
-    
+
     await node.close()
     return 0
 
 
-async def run_game_tunnel(
-    signaling_url: str,
-    room_id: str,
-    role: ConnectionRole,
-    protocol: str,
-    local_port: Optional[int],
-    remote_port: Optional[int],
-    local_port_udp: Optional[int],
-    remote_port_udp: Optional[int],
+# ============== tunnel (server / client) ==============
+
+async def _run_tunnel(
+    signaling: str,
+    room: str,
+    *,
+    is_server: bool,
+    tcp_port: Optional[int],
+    udp_port: Optional[int],
     name: str,
-):
-    """通用隧道模式 - 转发任意 TCP/UDP 流量（游戏联机、服务代理等）"""
-    tunnel_config = TunnelConfig(
+) -> int:
+    # 推断协议
+    if tcp_port and udp_port:
+        protocol = "both"
+    elif udp_port and not tcp_port:
+        protocol = "udp"
+    else:
+        protocol = "tcp"
+
+    role = ConnectionRole.RESPONDER if is_server else ConnectionRole.INITIATOR
+    role_label = "SERVER" if is_server else "CLIENT"
+
+    tunnel_cfg = TunnelConfig(
         protocol=protocol,
-        local_listen_port=local_port or 0,
-        remote_forward_port=remote_port or 0,
-        local_listen_port_udp=local_port_udp,
-        remote_forward_port_udp=remote_port_udp,
-        name=name,
+        name=name or role_label,
+        local_listen_port=tcp_port or 0,
+        remote_forward_port=tcp_port or 0,
+        local_listen_port_udp=udp_port,
+        remote_forward_port_udp=udp_port,
     )
 
-    p2p_config = P2PConfig(
+    # 打印实际映射
+    logger.info(f"=== tunnel {role_label} ===")
+    logger.info(f"protocol = {protocol}")
+    if is_server:
+        if tcp_port:
+            logger.info(f"P2P → forward to TCP 127.0.0.1:{tcp_port}")
+        if udp_port:
+            logger.info(f"P2P → forward to UDP 127.0.0.1:{udp_port}")
+    else:
+        if tcp_port:
+            logger.info(f"Listen TCP 127.0.0.1:{tcp_port} → P2P")
+        if udp_port:
+            logger.info(f"Listen UDP 127.0.0.1:{udp_port} → P2P")
+
+    p2p_cfg = P2PConfig(
         transport=TransportProtocol.AUTO,
         role=role,
         ice=IceConfig.with_cloudflare_turn(),
     )
-    p2p_config.signaling.server_url = signaling_url
+    p2p_cfg.signaling.server_url = signaling
 
-    tunnel = GameTunnel(p2p_config, tunnel_config, role)
+    tunnel = GameTunnel(p2p_cfg, tunnel_cfg, role)
 
-    # 定期打印统计
     async def print_stats():
         while True:
             await asyncio.sleep(30)
-            stats = tunnel.get_stats()
+            s = tunnel.get_stats()
             logger.info(
-                f"[STATS] Peers: {stats['peer_count']}, "
-                f"TCP: {stats['active_tcp']}, UDP: {stats['active_udp']}, "
-                f"Total: {stats['total_connections']}, "
-                f"Forwarded: {stats['bytes_forwarded_mb']} MB"
+                f"[STATS] peers={s['peer_count']} tcp={s['active_tcp']} udp={s['active_udp']} "
+                f"total={s['total_connections']} bytes={s['bytes_forwarded_mb']}MB"
             )
 
     stats_task = asyncio.create_task(print_stats())
-
     try:
-        await tunnel.start(signaling_url, room_id)
-        # 保持运行
+        await tunnel.start(signaling, room)
         while True:
             await asyncio.sleep(1.0)
     except KeyboardInterrupt:
@@ -334,182 +263,144 @@ async def run_game_tunnel(
     return 0
 
 
-def main():
-    """CLI 入口"""
-    parser = argparse.ArgumentParser(
-        description="P2P Communication Tool (QUIC + KCP + Cloudflare TURN)",
+# ============== CLI ==============
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="p2p",
+        description="P2P Tunnel (SCTP via DataChannel + Cloudflare TURN)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 1. 启动信令服务器 (终端1)
+  # 1) 信令服务器 (终端1)
   $ p2p-signaling --port 8765
 
-  # 2. P2P 通信测试
-  $ p2p --mode initiator --room test123 --transport auto
-  $ p2p --mode responder --room test123 --transport auto
+  # 2) P2P 通信测试 (side A 发消息, side B 回)
+  $ p2p chat my-room --as a
+  $ p2p chat my-room --as b
 
-  # 3. 通用 TCP 隧道 (如 Minecraft Java, Terraria, SSH)
-  #    HOST 端 (运行目标服务的人):
-  $ p2p --mode game --role host --room my-room --protocol tcp --remote-port 25565
-  #    CLIENT 端 (运行客户端的人):
-  $ p2p --mode game --role client --room my-room --protocol tcp --local-port 25565
-  #    然后客户端连接 -> 127.0.0.1:25565
+  # 3) 性能测试 (30s)
+  $ p2p bench my-room --as a
+  $ p2p bench my-room --as b
 
-  # 4. UDP 隧道 (如 Minecraft Bedrock, 饥荒联机版)
-  $ p2p --mode game --role host --room my-room --protocol udp --remote-port 19132
-  $ p2p --mode game --role client --room my-room --protocol udp --local-port 19132
+  # 4) TCP 隧道 (SERVER 跑服务端, 端口 25565)
+  $ p2p server my-room --tcp 25565
+  $ p2p client my-room --tcp 25565
+  # 用户客户端连接 127.0.0.1:25565
 
-  # 5. 同时转发 TCP + UDP (端口可不同)
-  $ p2p --mode game --role host --room my-room --protocol both --remote-port 25565 --remote-port-udp 19132
-  $ p2p --mode game --role client --room my-room --protocol both --local-port 25565 --local-port-udp 19132
+  # 5) UDP 隧道 (MC 基岩版端口 19132)
+  $ p2p server my-room --udp 19132
+  $ p2p client my-room --udp 19132
 
-  # 性能测试
-  $ p2p --mode benchmark --role initiator --room bench1
-  $ p2p --mode benchmark --role responder --room bench1
-        """,
-    )
+  # 6) 同时 TCP + UDP (端口可不同)
+  $ p2p server my-room --tcp 25565 --udp 19132
+  $ p2p client my-room --tcp 25565 --udp 19132
 
-    parser.add_argument(
-        "--mode",
-        choices=["initiator", "responder", "benchmark", "game"],
-        default="initiator",
-        help="运行模式: initiator|responder|benchmark|game (默认: initiator)",
+  # 7) 指定信令服务器
+  $ p2p server my-room -s ws://signaling.example.com:8765 --tcp 25565
+""",
     )
-    parser.add_argument(
-        "--transport",
-        choices=["quic", "kcp", "auto"],
-        default="auto",
-        help="传输协议 (默认: auto)",
-    )
-    parser.add_argument(
-        "--signaling",
-        default="ws://localhost:8765",
-        help="信令服务器地址 (默认: ws://localhost:8765)",
-    )
-    parser.add_argument(
-        "--room",
-        default="default-room",
-        help="房间 ID (默认: default-room)",
-    )
-    parser.add_argument(
-        "--role",
-        choices=["initiator", "responder", "host", "client"],
-        default=None,
-        help="角色: initiator|responder (通信), host|client (游戏)",
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="日志级别",
-    )
-    # 隧道模式参数
-    parser.add_argument(
-        "--protocol",
-        choices=["tcp", "udp", "both"],
-        default="tcp",
-        help="隧道协议: tcp|udp|both (默认: tcp)",
-    )
-    parser.add_argument(
-        "--local-port",
-        type=int,
-        default=None,
-        help="CLIENT 端本地监听端口 (TCP，或 UDP 未单独指定时)",
-    )
-    parser.add_argument(
-        "--remote-port",
-        type=int,
-        default=None,
-        help="HOST 端远端转发端口 (TCP，或 UDP 未单独指定时)",
-    )
-    parser.add_argument(
-        "--local-port-udp",
-        type=int,
-        default=None,
-        help="CLIENT 端本地 UDP 监听端口 (仅 both/udp 模式，默认与 --local-port 相同)",
-    )
-    parser.add_argument(
-        "--remote-port-udp",
-        type=int,
-        default=None,
-        help="HOST 端远端 UDP 转发端口 (仅 both/udp 模式，默认与 --remote-port 相同)",
-    )
-    parser.add_argument(
-        "--name",
-        default="tunnel",
-        help="隧道名称 (仅用于日志显示)",
-    )
-    
+    p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<cmd>")
+
+    # --- chat ---
+    sp = sub.add_parser("chat", help="P2P 通信测试 (A 发消息, B 回)")
+    sp.add_argument("room", help="房间 ID")
+    sp.add_argument("--as", dest="as_side", choices=["a", "b"], required=True,
+                    help="a=initiator(发测试消息), b=responder(回消息)")
+    sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING,
+                    help=f"信令服务器 (默认: {DEFAULT_SIGNALING})")
+    sp.add_argument("-t", "--transport", choices=["auto", "kcp", "quic"], default="auto",
+                    help="传输协议 (默认: auto)")
+
+    # --- bench ---
+    sp = sub.add_parser("bench", help="性能测试 (A 发大数据, B 收)")
+    sp.add_argument("room", help="房间 ID")
+    sp.add_argument("--as", dest="as_side", choices=["a", "b"], required=True,
+                    help="a=sender, b=receiver")
+    sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
+    sp.add_argument("-t", "--transport", choices=["auto", "kcp", "quic"], default="auto")
+    sp.add_argument("--duration", type=float, default=30.0,
+                    help="A 端发送时长（秒，默认 30）")
+
+    # --- server ---
+    sp = sub.add_parser("server", help="SERVER 端：将 P2P 流量转发到本地服务端口")
+    sp.add_argument("room", help="房间 ID（与 client 端相同）")
+    sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
+    sp.add_argument("--tcp", dest="tcp_port", type=int, default=None,
+                    help="本地目标 TCP 端口（SERVER 侧服务端监听端口）")
+    sp.add_argument("--udp", dest="udp_port", type=int, default=None,
+                    help="本地目标 UDP 端口（SERVER 侧服务端监听端口）")
+    sp.add_argument("--name", default="", help="日志显示名")
+
+    # --- client ---
+    sp = sub.add_parser("client", help="CLIENT 端：起本地监听，通过 P2P 连到 SERVER 端服务")
+    sp.add_argument("room", help="房间 ID（与 server 端相同）")
+    sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
+    sp.add_argument("--tcp", dest="tcp_port", type=int, default=None,
+                    help="本地监听 TCP 端口（用户客户端连这个）")
+    sp.add_argument("--udp", dest="udp_port", type=int, default=None,
+                    help="本地监听 UDP 端口（用户客户端连这个）")
+    sp.add_argument("--name", default="", help="日志显示名")
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
-    
-    # 配置日志
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level=args.log_level,
-        format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
-    )
-    
-    transport_map = {
-        "quic": TransportProtocol.QUIC,
-        "kcp": TransportProtocol.KCP,
-        "auto": TransportProtocol.AUTO,
-    }
-    transport = transport_map[args.transport]
 
-    role_map = {
-        "initiator": ConnectionRole.INITIATOR,
-        "responder": ConnectionRole.RESPONDER,
-        "host": ConnectionRole.RESPONDER,
-        "client": ConnectionRole.INITIATOR,
-    }
+    _setup_logger(args.log_level)
 
     try:
-        if args.mode == "initiator":
+        if args.cmd == "chat":
+            rc = asyncio.run(_run_chat(args.signaling, args.room, args.transport, args.as_side))
+        elif args.cmd == "bench":
             rc = asyncio.run(
-                run_initiator(args.signaling, args.room, transport)
+                _run_bench(args.signaling, args.room, args.transport, args.as_side, args.duration)
             )
-        elif args.mode == "responder":
-            rc = asyncio.run(
-                run_responder(args.signaling, args.room, transport)
-            )
-        elif args.mode == "benchmark":
-            role = role_map[args.role] if args.role else ConnectionRole.INITIATOR
-            rc = asyncio.run(
-                run_benchmark(args.signaling, args.room, role, transport)
-            )
-        elif args.mode == "game":
-            if not args.role or args.role not in ("host", "client"):
-                logger.error("Tunnel mode requires --role host or --role client")
+        elif args.cmd == "server":
+            if not (args.tcp_port or args.udp_port):
+                logger.error("server 需要至少一个: --tcp PORT 或 --udp PORT")
                 rc = 1
             else:
-                role = role_map[args.role]
                 rc = asyncio.run(
-                    run_game_tunnel(
-                        args.signaling,
-                        args.room,
-                        role,
-                        args.protocol,
-                        args.local_port,
-                        args.remote_port,
-                        args.local_port_udp,
-                        args.remote_port_udp,
-                        args.name,
+                    _run_tunnel(
+                        args.signaling, args.room,
+                        is_server=True,
+                        tcp_port=args.tcp_port,
+                        udp_port=args.udp_port,
+                        name=args.name,
+                    )
+                )
+        elif args.cmd == "client":
+            if not (args.tcp_port or args.udp_port):
+                logger.error("client 需要至少一个: --tcp PORT 或 --udp PORT")
+                rc = 1
+            else:
+                rc = asyncio.run(
+                    _run_tunnel(
+                        args.signaling, args.room,
+                        is_server=False,
+                        tcp_port=args.tcp_port,
+                        udp_port=args.udp_port,
+                        name=args.name,
                     )
                 )
         else:
             parser.print_help()
             rc = 1
-            
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info("Interrupted")
         rc = 0
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         rc = 1
-    
+
     sys.exit(rc)
 
 
 if __name__ == "__main__":
     main()
+

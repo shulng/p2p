@@ -73,11 +73,11 @@ uv run p2p-signaling --port 8765
 两个终端分别运行:
 
 ```bash
-# 终端 A (发起方)
-uv run p2p --mode initiator --room test123 --transport auto
+# 终端 A (发起方, 主动发测试消息)
+uv run p2p chat test123 --as a
 
-# 终端 B (响应方)
-uv run p2p --mode responder --room test123 --transport auto
+# 终端 B (响应方, 回显消息)
+uv run p2p chat test123 --as b
 ```
 
 ### 3. 通用隧道(TCP/UDP 转发)
@@ -103,10 +103,10 @@ uv run p2p --mode responder --room test123 --transport auto
 
 ### 角色说明
 
-| 角色 | CLI 参数 | 含义 | 本地行为 |
-|------|----------|------|----------|
-| **HOST** | `--role host` | 运行目标服务端的人(RESPONDER) | 接收 P2P 数据,转发到本地目标服务 |
-| **CLIENT** | `--role client` | 运行用户客户端的人(INITIATOR) | 本地起监听,用户客户端连这里 |
+| 角色 | CLI 子命令 | 含义 | 本地行为 |
+|------|------------|------|----------|
+| **SERVER** | `p2p server` | 运行目标服务端的人(RESPONDER) | 接收 P2P 数据,转发到本地目标服务 |
+| **CLIENT** | `p2p client` | 运行用户客户端的人(INITIATOR) | 本地起监听,用户客户端连这里 |
 
 ### 操作步骤
 
@@ -116,70 +116,64 @@ uv run p2p --mode responder --room test123 --transport auto
 uv run p2p-signaling --port 8765
 ```
 
-**终端 2 — HOST 端**(运行目标服务的人):
+**终端 2 — SERVER 端**(运行目标服务的人):
 
 ```bash
-uv run p2p --mode game --role host \
-  --protocol tcp \
-  --remote-port 25565 \
-  --room my-room \
-  --signaling ws://<信令服务器IP>:8765
+uv run p2p server my-room --tcp 25565 \
+  -s ws://<信令服务器IP>:8765
 ```
 
 **终端 3 — CLIENT 端**(运行用户客户端的人):
 
 ```bash
-uv run p2p --mode game --role client \
-  --protocol tcp \
-  --local-port 25565 \
-  --room my-room \
-  --signaling ws://<信令服务器IP>:8765
+uv run p2p client my-room --tcp 25565 \
+  -s ws://<信令服务器IP>:8765
 ```
 
-**最后**:用户客户端连接 `127.0.0.1:25565` 即可(等于直连 HOST 的目标服务)。
+**最后**:用户客户端连接 `127.0.0.1:25565` 即可(等于直连 SERVER 的目标服务)。
 
-### 协议选择
+### 协议自动推断
 
-| `--protocol` | 用途 | 示例游戏/服务 |
-|--------------|------|---------------|
-| `tcp`(默认) | TCP 流量转发 | Minecraft Java(25565)、泰拉瑞亚(7777)、SSH(22) |
-| `udp` | UDP 数据包转发 | Minecraft 基岩版(19132)、饥荒联机版(10999) |
-| `both` | 同时转发 TCP + UDP | 需要双协议的服务,端口可不同 |
+不用再手动指定 `--protocol`,由 `--tcp` / `--udp` 是否给出自动推断:
+
+| 给出的参数 | 推断协议 | 用途 |
+|------------|----------|------|
+| `--tcp PORT` | `tcp` | TCP 流量转发(Minecraft Java 25565、泰拉瑞亚 7777、SSH 22) |
+| `--udp PORT` | `udp` | UDP 数据包转发(Minecraft 基岩版 19132、饥荒联机版 10999) |
+| `--tcp PORT --udp PORT2` | `both` | 同时转发 TCP + UDP,端口可不同 |
 
 ### 常见场景示例
 
 **Minecraft Java 版(TCP 25565)**:
 
 ```bash
-# HOST (运行 MC 服务端)
-uv run p2p --mode game --role host --protocol tcp --remote-port 25565 --room mc-room
+# SERVER (运行 MC 服务端)
+uv run p2p server mc-room --tcp 25565
 
 # CLIENT (运行 MC 客户端)
-uv run p2p --mode game --role client --protocol tcp --local-port 25565 --room mc-room
+uv run p2p client mc-room --tcp 25565
 # MC 客户端连接 127.0.0.1:25565
 ```
 
 **Minecraft 基岩版(UDP 19132)**:
 
 ```bash
-# HOST
-uv run p2p --mode game --role host --protocol udp --remote-port 19132 --room mc-bedrock
+# SERVER
+uv run p2p server mc-bedrock --udp 19132
 
 # CLIENT
-uv run p2p --mode game --role client --protocol udp --local-port 19132 --room mc-bedrock
+uv run p2p client mc-bedrock --udp 19132
 # MC 基岩版客户端连接 127.0.0.1:19132
 ```
 
 **同时转发 TCP + UDP(端口不同)**:
 
 ```bash
-# HOST: TCP 25565 + UDP 19132
-uv run p2p --mode game --role host --protocol both \
-  --remote-port 25565 --remote-port-udp 19132 --room both-room
+# SERVER: TCP 25565 + UDP 19132
+uv run p2p server both-room --tcp 25565 --udp 19132
 
 # CLIENT: TCP 25565 + UDP 19132
-uv run p2p --mode game --role client --protocol both \
-  --local-port 25565 --local-port-udp 19132 --room both-room
+uv run p2p client both-room --tcp 25565 --udp 19132
 ```
 
 ### 端口冲突处理
@@ -187,36 +181,55 @@ uv run p2p --mode game --role client --protocol both \
 如果 CLIENT 端本机端口被占用,改用其他端口:
 
 ```bash
-uv run p2p --mode game --role client --protocol tcp \
-  --local-port 35565 --room mc-room
+uv run p2p client mc-room --tcp 35565
 # 客户端连接 127.0.0.1:35565
 ```
 
-如果 HOST 端目标服务端口非默认,用 `--remote-port` 指定:
+如果 SERVER 端目标服务端口非默认,直接在 `--tcp` / `--udp` 指定:
 
 ```bash
-uv run p2p --mode game --role host --protocol tcp \
-  --remote-port 25566 --room mc-room
+uv run p2p server mc-room --tcp 25566
 ```
 
 ## CLI 参数
 
-### `p2p` 命令
+### `p2p` 命令(子命令式)
 
-| 参数 | 说明 | 默认值 |
+```
+p2p [--log-level LEVEL] <cmd> [options]
+```
+
+| 子命令 | 用途 | 必需参数 |
+|--------|------|----------|
+| `chat <room> --as a\|b` | P2P 通信测试(A 发消息,B 回) | `--as` |
+| `bench <room> --as a\|b` | 性能测试(A 发大数据 30s,B 收) | `--as` |
+| `server <room> --tcp\|--udp PORT` | SERVER 端隧道(转发 P2P→本地服务) | `--tcp` 或 `--udp` 至少一个 |
+| `client <room> --tcp\|--udp PORT` | CLIENT 端隧道(本地监听→P2P) | `--tcp` 或 `--udp` 至少一个 |
+
+**通用选项**(所有子命令):
+
+| 选项 | 说明 | 默认值 |
 |------|------|--------|
-| `--mode` | 运行模式:`initiator` / `responder` / `benchmark` / `game` | `initiator` |
-| `--transport` | 传输协议:`quic` / `kcp` / `auto` | `auto` |
-| `--signaling` | 信令服务器地址 | `ws://localhost:8765` |
-| `--room` | 房间 ID | `default-room` |
-| `--role` | 角色:`initiator` / `responder`(通信)或 `host` / `client`(隧道) | - |
-| `--protocol` | 隧道协议:`tcp` / `udp` / `both`(仅 game 模式) | `tcp` |
-| `--local-port` | CLIENT 端本地监听端口(TCP,或 UDP 未单独指定时) | - |
-| `--remote-port` | HOST 端远端转发端口(TCP,或 UDP 未单独指定时) | - |
-| `--local-port-udp` | CLIENT 端本地 UDP 监听端口(仅 both/udp 模式) | 同 `--local-port` |
-| `--remote-port-udp` | HOST 端远端 UDP 转发端口(仅 both/udp 模式) | 同 `--remote-port` |
-| `--name` | 隧道名称(仅日志显示) | `tunnel` |
-| `--log-level` | 日志级别:`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
+| `-s, --signaling URL` | 信令服务器地址 | `ws://localhost:8765` |
+| `--log-level LEVEL` | 日志级别:`DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
+
+**`chat` / `bench` 专属:**
+
+| 选项 | 说明 | 默认值 |
+|------|------|--------|
+| `--as a\|b` | a=initiator(sender), b=responder(receiver) | 必填 |
+| `-t, --transport auto\|kcp\|quic` | 传输协议 | `auto` |
+| `--duration SECONDS`(仅 bench) | A 端发送时长 | `30` |
+
+**`server` / `client` 专属:**
+
+| 选项 | 说明 | 默认值 |
+|------|------|--------|
+| `--tcp PORT` | TCP 端口(SERVER=转发目标,CLIENT=本地监听) | - |
+| `--udp PORT` | UDP 端口(同上) | - |
+| `--name NAME` | 日志显示名 | `SERVER` / `CLIENT` |
+
+> 协议由 `--tcp` / `--udp` 是否给出自动推断:只给 `--tcp` → `tcp`,只给 `--udp` → `udp`,两者都给 → `both`。
 
 ### `p2p-signaling` 命令
 
@@ -384,8 +397,8 @@ uv run python -c "import p2p"
 uv run p2p-signaling --port 8765
 
 # 测试 P2P 连接
-uv run p2p --mode initiator --room test
-uv run p2p --mode responder --room test
+uv run p2p chat test --as a
+uv run p2p chat test --as b
 ```
 
 ## 许可
