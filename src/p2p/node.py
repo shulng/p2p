@@ -63,6 +63,10 @@ class P2PNode:
         self._signaling: Optional[SignalingClient] = None
         # 多 Peer：每个 peer_id 拥有独立的 IceManager / RTCPeerConnection
         self._ice_managers: Dict[str, IceManager] = {}
+        # 多 Peer 消息有序处理：per-peer 队列 + worker，保证同一 peer 的消息按到达顺序处理
+        # （TCP 流转发强依赖字节顺序，create_task 并发会导致数据乱序）
+        self._peer_msg_queues: Dict[str, "asyncio.Queue[Optional[Message]]"] = {}
+        self._peer_msg_workers: Dict[str, asyncio.Task] = {}
         self._quic: Optional[QUICTransport] = None
         self._kcp: Optional[KCPTransport] = None
 
@@ -380,7 +384,7 @@ class P2PNode:
         await self._cleanup_and_notify(peer_id)
 
     async def _cleanup_peer(self, peer_id: str) -> None:
-        """清理指定 peer 的所有资源（IceManager / 锁 / 事件 / peer 状态）
+        """清理指定 peer 的所有资源（IceManager / 锁 / 事件 / peer 状态 / 消息队列）
 
         幂等：重复调用安全。用于连接失败、ICE 断开、peer 离开等所有清理路径。
         """
@@ -393,6 +397,20 @@ class P2PNode:
                 await ice.close()
             except Exception as e:
                 logger.debug(f"[P2PNode] Error closing IceManager for {peer_id}: {e}")
+        # 停止消息 worker：发送 None 停止信号
+        queue = self._peer_msg_queues.pop(peer_id, None)
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+        worker = self._peer_msg_workers.pop(peer_id, None)
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
         return was_connected
 
     async def _fail_peer_connection(self, peer_id: str, reason: str) -> None:
@@ -442,30 +460,67 @@ class P2PNode:
         transport: TransportProtocol,
         peer_id: Optional[str] = None,
     ) -> None:
-        """处理从传输层收到的数据"""
+        """处理从传输层收到的数据
+
+        关键：同一 peer 的消息必须按到达顺序处理（TCP 字节流强依赖顺序）。
+        通过 per-peer 队列 + 单 worker 串行 await，避免 create_task 并发导致乱序。
+        """
         try:
             msg = self._decode_message(data)
             logger.debug(
                 f"[P2PNode] Received {msg.msg_type.value} via {transport.value} "
                 f"from {msg.sender_id}"
             )
-            if self.on_message:
-                result = self.on_message(msg)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
-        except Exception as e:
-            # 如果不是 Message 格式，当作原始二进制数据
-            sender = peer_id or "unknown"
+        except Exception:
+            # 解码失败：包装成原始二进制消息
+            sender = msg.sender_id if 'msg' in locals() else (peer_id or "unknown")
             msg = Message.create(
                 msg_type=MessageType.DATA_BINARY,
                 sender_id=sender,
                 receiver_id=self.peer_id,
                 payload=data,
             )
-            if self.on_message:
-                result = self.on_message(msg)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+
+        if self.on_message:
+            # 按 sender_id 路由到 per-peer 有序队列
+            queue_key = msg.sender_id or (peer_id or "unknown")
+            self._enqueue_message(queue_key, msg)
+
+    def _enqueue_message(self, peer_id: str, msg: Message) -> None:
+        """将消息放入 per-peer 队列，按到达顺序处理"""
+        queue = self._get_or_create_msg_queue(peer_id)
+        try:
+            queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            logger.warning(f"[P2PNode] Message queue full for {peer_id}, dropping")
+
+    def _get_or_create_msg_queue(self, peer_id: str) -> "asyncio.Queue[Optional[Message]]":
+        """获取或创建 per-peer 消息队列 + worker"""
+        if peer_id not in self._peer_msg_queues:
+            queue: "asyncio.Queue[Optional[Message]]" = asyncio.Queue(maxsize=10000)
+            self._peer_msg_queues[peer_id] = queue
+            self._peer_msg_workers[peer_id] = asyncio.create_task(
+                self._msg_worker(peer_id, queue)
+            )
+            logger.debug(f"[P2PNode] Created message queue+worker for {peer_id}")
+        return self._peer_msg_queues[peer_id]
+
+    async def _msg_worker(self, peer_id: str, queue: "asyncio.Queue[Optional[Message]]") -> None:
+        """per-peer 消息处理 worker：按队列顺序 await 处理，保证消息不乱序"""
+        while True:
+            msg = await queue.get()
+            if msg is None:  # 停止信号
+                queue.task_done()
+                break
+            try:
+                if self.on_message:
+                    result = self.on_message(msg)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except Exception as e:
+                logger.error(f"[P2PNode] Message handler error for {peer_id}: {e}")
+            finally:
+                queue.task_done()
 
     def _encode_message(self, msg: Message) -> bytes:
         """编码消息为二进制"""
@@ -583,6 +638,8 @@ class P2PNode:
         self._ice_managers.clear()
         self._wait_answer_events.clear()
         self._negotiation_locks.clear()
+        self._peer_msg_queues.clear()
+        self._peer_msg_workers.clear()
 
         if self._kcp:
             try:
