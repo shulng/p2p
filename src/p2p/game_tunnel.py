@@ -21,6 +21,7 @@ from loguru import logger
 from .config import P2PConfig, TransportProtocol, ConnectionRole, IceConfig
 from .node import P2PNode
 from .types import Message, MessageType, ConnectionState
+from .hybrid_transport import CHANNEL_CONTROL, CHANNEL_REALTIME
 
 
 # 隧道消息类型（复用 Message 结构，payload 为 dict）
@@ -169,12 +170,13 @@ class GameTunnel:
         # 校验端口配置
         self._validate_config()
 
-        # 设置 P2P 节点
+        # 设置 P2P 节点 (启用混合传输: QUIC/KCP/SCTP 按类型分流)
         self._node = P2PNode(
             config=self.p2p_config,
             on_message=self._on_p2p_message,
             on_peer_connected=self._on_peer_connected,
             on_peer_disconnected=self._on_peer_disconnected,
+            enable_hybrid=True,
         )
         await self._node.initialize()
         await self._node.connect_to_signaling()
@@ -509,14 +511,26 @@ class GameTunnel:
             await self._handle_remote_udp_close(conn_id)
 
     async def _send_tunnel_message(self, tunnel_type: str, conn_id: str, data: bytes) -> None:
-        """通过 P2P 发送隧道消息（按 conn_id 路由到对应 peer）"""
+        """通过 P2P 发送隧道消息（按 conn_id 路由到对应 peer）
+
+        分流策略（混合传输）:
+          - 控制消息 (open/close) → CHANNEL_CONTROL (SCTP/DataChannel)
+          - 数据消息 (DATA)       → CHANNEL_REALTIME (KCP 优先, 降级 SCTP)
+        """
         if not self._node:
             return
         # 优先用 conn_id 映射的 peer（多 peer 路由），回退到首个 peer（CLIENT 端单 peer）
         peer_id = self._conn_to_peer.get(conn_id) or self._peer_id
         if not peer_id:
             return
-        await self._node.send_to_peer(
+
+        # 按消息类型选择通道
+        if tunnel_type in (TUNNEL_TCP_DATA, TUNNEL_UDP_DATA):
+            channel = CHANNEL_REALTIME  # 实时数据 → KCP
+        else:
+            channel = CHANNEL_CONTROL   # 控制信令 → SCTP
+
+        await self._node.send_to_peer_channel(
             peer_id,
             MessageType.DATA_JSON,
             {
@@ -524,6 +538,7 @@ class GameTunnel:
                 "conn_id": conn_id,
                 "data": data,
             },
+            channel=channel,
         )
 
     def _on_peer_connected(self, peer_info) -> None:

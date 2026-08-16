@@ -40,6 +40,13 @@ from .signaling_client import SignalingClient, SignalingEvents
 from .signaling_server import SignalingServer
 from .node import P2PNode
 from .game_tunnel import GameTunnel, TunnelConfig
+from .hybrid_transport import (
+    HybridTransport,
+    HybridStats,
+    CHANNEL_CONTROL,
+    CHANNEL_REALTIME,
+    CHANNEL_BULK,
+)
 
 __all__ = [
     # Config
@@ -78,4 +85,10 @@ __all__ = [
     # Game Tunnel
     "GameTunnel",
     "TunnelConfig",
+    # Hybrid Transport
+    "HybridTransport",
+    "HybridStats",
+    "CHANNEL_CONTROL",
+    "CHANNEL_REALTIME",
+    "CHANNEL_BULK",
 ]

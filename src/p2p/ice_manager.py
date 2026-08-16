@@ -297,6 +297,13 @@ class IceManager:
 
     async def send_data(self, data: bytes) -> bool:
         """通过 DataChannel 发送数据"""
+        return self.send_data_sync(data)
+
+    def send_data_sync(self, data: bytes) -> bool:
+        """同步发送数据（DataChannel.send 本身为同步写入 SCTP 缓冲）
+
+        供混合传输的 SCTP 同步回调使用，保证字节序严格一致（TCP 流转发依赖）。
+        """
         if not self._data_channel or not self._data_channel_open.is_set():
             return False
         try:

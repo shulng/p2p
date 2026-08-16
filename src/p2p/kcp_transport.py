@@ -152,6 +152,8 @@ class KCPTransport:
             except asyncio.TimeoutError:
                 logger.warning(f"[KCP] Connection timeout to {remote_addr}")
                 self._set_state(ConnectionState.FAILED)
+                # 失败必须清理 recv/update 循环，否则持续向无效地址发包刷错误
+                await self.close()
                 return False
                 
         except Exception as e:
@@ -195,6 +197,7 @@ class KCPTransport:
             except asyncio.TimeoutError:
                 logger.warning("[KCP] Accept connection timeout")
                 self._set_state(ConnectionState.FAILED)
+                await self.close()
                 return False
                 
         except Exception as e:
