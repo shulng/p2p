@@ -5,9 +5,5 @@ build/
 dist/
 wheels/
 *.egg-info
-main.build/
-main.dist/
-main.onefile-build/
-main.exe
 # Virtual environments
 .venv
