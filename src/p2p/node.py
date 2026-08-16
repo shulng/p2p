@@ -385,10 +385,10 @@ class P2PNode:
         )
         # 注入 SCTP 发送回调（必须同步:DataChannel.send 本身同步,且保证 TCP 字节序）
         hybrid.on_sctp_ready(lambda data: ice.send_data_sync(data))
-        # 设置数据接收回调:control 通道走 on_message,realtime/bulk 通道由上层(GameTunnel)处理
+        # 设置数据接收回调:所有通道(CTRL/REALTIME/BULK)收到的都是序列化 Message,
+        # 统一交给 _handle_transport_data 解码并路由到 on_message(per-peer 有序队列)
         def _on_hybrid_data(data: bytes, channel: str) -> None:
-            if channel == CHANNEL_CONTROL:
-                self._handle_transport_data(data, self.config.transport, peer_id)
+            self._handle_transport_data(data, self.config.transport, peer_id)
         hybrid.on_data = _on_hybrid_data
 
         self._hybrid[peer_id] = hybrid

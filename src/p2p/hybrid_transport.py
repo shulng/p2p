@@ -88,9 +88,10 @@ class HybridTransport:
         # 数据接收回调: (data: bytes, channel: str) -> None
         self.on_data: Optional[Callable[[bytes, str], None]] = None
 
-        # 对端的 KCP/QUIC 地址
+        # 对端的 KCP/QUIC 地址 + KCP conv(RESPONDER 分配,INITIATOR 复用)
         self._remote_kcp_addr: Optional[Tuple[str, int]] = None
         self._remote_quic_addr: Optional[Tuple[str, int]] = None
+        self._remote_kcp_conv: Optional[int] = None
 
         # 本地 KCP/QUIC 监听地址
         self._local_kcp_addr: Optional[Tuple[str, int]] = None
@@ -224,23 +225,31 @@ class HybridTransport:
         # 广播前把 0.0.0.0 替换为真实可达 IP,避免对端 connect 失败
         kcp_adv = self._reachable_addr(self._local_kcp_addr)
         quic_adv = self._reachable_addr(self._local_quic_addr)
+        # KCP 协议要求双方 conv 一致才能通信:RESPONDER 把自己的 conv 一起广播,
+        # INITIATOR 用它构造 KCPTransport(否则 conv 不匹配,握手包被对端 KCP 丢弃)
+        kcp_conv = self._kcp.conv_id if self._kcp else None
         addr_msg = {
             "type": HYBRID_MSG_ADDR,
             "kcp_addr": list(kcp_adv) if kcp_adv else None,
             "quic_addr": list(quic_adv) if quic_adv else None,
+            "kcp_conv": kcp_conv,
             "ts": time.time(),
         }
         payload = json.dumps(addr_msg).encode("utf-8")
         if self._sctp_send(payload):
-            logger.info(f"[Hybrid] Sent addr: kcp={kcp_adv}, quic={quic_adv}")
+            logger.info(f"[Hybrid] Sent addr: kcp={kcp_adv}, quic={quic_adv}, conv={kcp_conv}")
 
     def _handle_addr_exchange(self, msg: Dict[str, Any]) -> None:
         """收到对端的 KCP/QUIC 地址"""
         kcp = msg.get("kcp_addr")
         quic = msg.get("quic_addr")
+        # KCP conv 由 RESPONDER 分配,INITIATOR 必须复用以匹配会话
+        self._remote_kcp_conv = msg.get("kcp_conv")
         if kcp:
             self._remote_kcp_addr = (kcp[0], kcp[1])
-            logger.info(f"[Hybrid] Remote KCP addr: {self._remote_kcp_addr}")
+            logger.info(
+                f"[Hybrid] Remote KCP addr: {self._remote_kcp_addr}, conv={self._remote_kcp_conv}"
+            )
         if quic:
             self._remote_quic_addr = (quic[0], quic[1])
             logger.info(f"[Hybrid] Remote QUIC addr: {self._remote_quic_addr}")
@@ -256,8 +265,10 @@ class HybridTransport:
         """INITIATOR 端:用收到的地址发起 KCP/QUIC 直连"""
         if self.enable_kcp and self._remote_kcp_addr:
             try:
+                # 用 RESPONDER 广播的 conv 构造,确保 KCP 会话 ID 一致
                 self._kcp = KCPTransport(
                     config=self.kcp_config,
+                    conv_id=self._remote_kcp_conv,
                     on_data_received=self._on_kcp_data,
                 )
                 await self._kcp.bind()
