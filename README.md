@@ -65,8 +65,6 @@ uv sync
 | `pydantic` | 数据校验 |
 | `loguru` | 日志 |
 
-> `nuitka`（打包 `main.exe` 用）为可选构建依赖，通过 `uv sync --extra build` 安装。
-
 ## 快速开始
 
 提供两个 CLI 命令:`p2p`(节点)和 `p2p-signaling`(信令服务器)。
