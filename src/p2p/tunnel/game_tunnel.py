@@ -210,6 +210,10 @@ class GameTunnel:
                 targets.append(
                     f"UDP {self.tunnel_config.remote_forward_host}:{self._remote_udp_port()}"
                 )
+            # UDP 空闲清理只对 HOST 端有意义（_udp_relays 仅在 HOST 端填充），
+            # 且清理逻辑在 _cleanup_udp_sessions 中按 UDP_SESSION_TIMEOUT 回收空闲会话。
+            if proto in ("udp", "both"):
+                self._udp_cleanup_task = asyncio.create_task(self._cleanup_udp_sessions())
             logger.info(f"Ready! Forwarding P2P -> {', '.join(targets)}")
         else:
             # CLIENT 端：启动本地监听
@@ -225,7 +229,6 @@ class GameTunnel:
                     f"UDP: connect your client to "
                     f"{self.tunnel_config.local_listen_host}:{self._local_udp_port()}"
                 )
-                self._udp_cleanup_task = asyncio.create_task(self._cleanup_udp_sessions())
 
         logger.info("=== Tunnel Active ===")
 

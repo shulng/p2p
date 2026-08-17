@@ -133,8 +133,20 @@ class SignalingServer:
     def _register_join(
         self, ws: WSConnection, msg: dict[str, Any]
     ) -> SignalingClientConnection:
-        """登记 join 消息并返回客户端连接对象"""
+        """登记 join 消息并返回客户端连接对象
+
+        注意：客户端上报的 peer_id 不可信。若该 ID 已被其他连接占用，
+        强制为其分配新 ID，避免恶意客户端通过伪造 peer_id 覆盖/劫持
+        现有会话（否则会截获本应转发给受害者的 Offer/Answer/ICE 候选）。
+        """
         peer_id = msg.get("peer_id") or generate_peer_id()
+        # 防伪造/冲突：若 peer_id 已被占用，则分配全新 ID，不覆盖已有连接
+        if peer_id in self._clients:
+            logger.warning(
+                f"[Signaling] peer_id {peer_id} already registered, "
+                f"assigning new ID to avoid session hijack"
+            )
+            peer_id = generate_peer_id()
         room_id = msg.get("room_id")
         role_str = msg.get("role", ConnectionRole.INITIATOR.value)
 
@@ -223,13 +235,13 @@ class SignalingServer:
         peer_id = client.peer_id
         room_id = client.room_id
 
-        if peer_id in self._clients:
+        # 仅当仍是同一连接时才移除；防止旧连接断开时误删已重新加入的同名连接
+        if self._clients.get(peer_id) is client:
             del self._clients[peer_id]
-
-        if room_id and room_id in self._rooms:
-            self._rooms[room_id].discard(peer_id)
-            if not self._rooms[room_id]:
-                del self._rooms[room_id]
+            if room_id and room_id in self._rooms:
+                self._rooms[room_id].discard(peer_id)
+                if not self._rooms[room_id]:
+                    del self._rooms[room_id]
 
         logger.info(f"[Signaling] Peer {peer_id} disconnected from room {room_id}")
 

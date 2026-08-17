@@ -179,15 +179,18 @@ class P2PNode:
             # 1. 创建 SDP Offer
             offer = await ice.create_offer()
 
-            # 2. 通过信令发送 Offer
+            # 2. 先注册 Answer 事件再发送 Offer，避免竞态：
+            #    _signal_on_answer 经 create_task 异步调度，若 Answer 在 send_offer
+            #    让出事件循环后、注册事件前到达，事件会被静默丢弃并导致 30s 超时误判失败。
+            answer_event = asyncio.Event()
+            self._wait_answer_events[target_peer_id] = answer_event
+
+            # 3. 通过信令发送 Offer
             await self._signaling.send_offer(target_peer_id, offer)
 
             logger.info(f"[P2PNode] Offer sent to {target_peer_id}, waiting for answer...")
 
-            # 3. 等待 Answer（per-peer event）
-            answer_event = asyncio.Event()
-            self._wait_answer_events[target_peer_id] = answer_event
-
+            # 4. 等待 Answer（per-peer event）
             try:
                 await asyncio.wait_for(answer_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
