@@ -39,6 +39,31 @@ def _bound(low: int, x: int, high: int) -> int:
     return max(low, min(x, high))
 
 
+def _seq_wrap(seq: int) -> int:
+    """将序号限制在 32 位无符号范围内，模拟 KCP C 版的 uint32 回绕。"""
+    return seq & 0xFFFFFFFF
+
+
+def _seq_lt(a: int, b: int) -> int:
+    """32 位回绕意义下 a < b"""
+    return _seq_wrap(a - b) >= 0x80000000 and a != b
+
+
+def _seq_gt(a: int, b: int) -> int:
+    """32 位回绕意义下 a > b"""
+    return _seq_wrap(b - a) >= 0x80000000 and a != b
+
+
+def _seq_ge(a: int, b: int) -> int:
+    """32 位回绕意义下 a >= b"""
+    return _seq_gt(a, b) or a == b
+
+
+def _seq_le(a: int, b: int) -> int:
+    """32 位回绕意义下 a <= b"""
+    return _seq_lt(a, b) or a == b
+
+
 def _itime_now() -> int:
     """获取当前时间(毫秒)"""
     return int(time.time() * 1000) & 0xFFFFFFFF
@@ -218,7 +243,17 @@ class KCP:
                 logger.error(f"Failed to parse KCP segment: {e}")
                 return -1
 
-            offset += KCP_OVERHEAD + len(seg.data)
+            # 声明长度(段头 len 字段)超过实际剩余字节时，说明包被截断/伪造，
+            # 若按 len(seg.data)(已被切片截断)推进会导致偏移失步、后续全部解析错乱。
+            declared_len = int.from_bytes(data[offset + 20 : offset + 24], "little")
+            if declared_len > len(data) - offset - KCP_OVERHEAD:
+                logger.warning(
+                    f"KCP segment length overflow: declared={declared_len}, "
+                    f"available={len(data) - offset - KCP_OVERHEAD}"
+                )
+                break
+
+            offset += KCP_OVERHEAD + declared_len
             total_processed += 1
 
             if seg.conv != self.conv:
@@ -242,7 +277,9 @@ class KCP:
             elif seg.cmd == KCP_CMD_PUSH:
                 # 数据推送
                 repeat = False
-                if (seg.sn - self.rcv_nxt) >= 0 and (self.rcv_nxt + self.rcv_wnd - seg.sn) > 0:
+                if _seq_ge(seg.sn, self.rcv_nxt) and _seq_gt(
+                    self.rcv_nxt + self.rcv_wnd, seg.sn
+                ):
                     # 仅在窗口内且非重复的段才回 ACK，
                     # 否则超窗段（sn >= rcv_nxt+rcv_wnd）也会被确认，
                     # 导致发送方误以为所有段送达而提前清空 snd_buf。
@@ -267,13 +304,14 @@ class KCP:
         return total_processed
 
     def __check_una(self, una: int) -> int:
-        return self.snd_una < una <= self.snd_nxt - 1
+        # 32 位回绕比较，避免长会话下序号超过 2^32 后判断失效
+        return _seq_gt(una, self.snd_una) and _seq_le(una, _seq_wrap(self.snd_nxt - 1))
 
     def __parse_una(self, una: int) -> None:
         """处理 una (未确认序号)"""
         new_snd_buf = []
         for seg in self.snd_buf:
-            if una - seg.sn > 0:
+            if _seq_gt(una, seg.sn):
                 pass  # 已确认，丢弃
             else:
                 new_snd_buf.append(seg)
@@ -284,7 +322,8 @@ class KCP:
             self.snd_una = self.snd_buf[0].sn
 
     def __check_ack(self, sn: int) -> int:
-        return sn - self.snd_una >= 0 and self.snd_nxt - sn > 0
+        # 32 位回绕比较
+        return _seq_ge(sn, self.snd_una) and _seq_lt(sn, self.snd_nxt)
 
     def __parse_ack(self, sn: int, ts: int) -> None:
         """处理确认"""
@@ -349,7 +388,7 @@ class KCP:
         inserted = False
         for i in range(len(self.rcv_buf) - 1, -1, -1):
             seg = self.rcv_buf[i]
-            if (newseg.sn - seg.sn) > 0:
+            if _seq_gt(newseg.sn, seg.sn):
                 self.rcv_buf.insert(i + 1, newseg)
                 inserted = True
                 break
@@ -364,7 +403,7 @@ class KCP:
         while self.rcv_buf:
             seg = self.rcv_buf[0]
             if seg.sn == self.rcv_nxt and len(self.rcv_queue) < self.rcv_wnd:
-                self.rcv_nxt += 1
+                self.rcv_nxt = _seq_wrap(self.rcv_nxt + 1)
                 self.rcv_queue.append(self.rcv_buf.pop(0))
             else:
                 break
@@ -407,7 +446,7 @@ class KCP:
                 data=data[start:end],
             )
             self.snd_queue.append(seg)
-            self.snd_nxt += 1
+            self.snd_nxt = _seq_wrap(self.snd_nxt + 1)
 
         return 0
 

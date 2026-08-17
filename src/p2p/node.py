@@ -629,12 +629,12 @@ class P2PNode:
     def _encode_payload(payload: Any) -> Any:
         """递归将 payload 编码为可 JSON 序列化的结构
 
-        - bytes -> {"__bytes__": "<base64>"}（解码时还原为 bytes）
+        - bytes -> {"__type__": "bytes", "__data__": "<base64>"}（解码时还原为 bytes）
         - dict / list 递归处理内嵌的 bytes（如隧道消息 {..., "data": b'...'}）
         - 其余原样返回（str / None / 数值等，须为 JSON 可序列化类型）
         """
         if isinstance(payload, bytes):
-            return {"__bytes__": base64.b64encode(payload).decode("ascii")}
+            return {"__type__": "bytes", "__data__": base64.b64encode(payload).decode("ascii")}
         if isinstance(payload, dict):
             return {k: P2PNode._encode_payload(v) for k, v in payload.items()}
         if isinstance(payload, (list, tuple)):
@@ -645,8 +645,9 @@ class P2PNode:
     def _decode_payload(payload: Any) -> Any:
         """将 JSON 结构还原为原始 payload"""
         if isinstance(payload, dict):
-            if len(payload) == 1 and "__bytes__" in payload:
-                return base64.b64decode(payload["__bytes__"])
+            # 仅当存在 __type__ 标记时才解码为 bytes，避免与用户合法字典冲突
+            if payload.get("__type__") == "bytes" and "__data__" in payload:
+                return base64.b64decode(payload["__data__"])
             return {k: P2PNode._decode_payload(v) for k, v in payload.items()}
         if isinstance(payload, list):
             return [P2PNode._decode_payload(item) for item in payload]

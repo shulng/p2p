@@ -101,8 +101,7 @@ class SignalingClient:
 
             logger.info(f"[SignalingClient] Connected as {self.peer_id}")
 
-            if self.events.on_connected:
-                self.events.on_connected()
+            _dispatch(self.events.on_connected)
 
             # 启动接收循环
             self._recv_task = asyncio.create_task(self._recv_loop())
@@ -211,8 +210,7 @@ class SignalingClient:
             self._connected = False
             self._connected_event.clear()
 
-            if self.events.on_disconnected:
-                self.events.on_disconnected()
+            _dispatch(self.events.on_disconnected)
 
             # 尝试重连
             if self._running:

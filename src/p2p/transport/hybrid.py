@@ -127,7 +127,9 @@ class KCPDataTransport:
         # 尝试解析为 KCP 管理消息
         try:
             text = data.decode("utf-8", errors="strict")
-            if text.startswith("{") and KCP_MSG_ADDR in text:
+            # 仅当 type 字段精确等于 KCP_MSG_ADDR 时才作为管理消息处理，
+            # 避免业务 JSON 中恰好包含 "kcp.addr" 子串时被误判并丢弃数据。
+            if text.startswith("{"):
                 msg = json.loads(text)
                 if msg.get("type") == KCP_MSG_ADDR:
                     self._handle_addr_exchange(msg)

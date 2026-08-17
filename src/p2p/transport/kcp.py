@@ -82,13 +82,21 @@ class KCPTransport:
                 self.on_connection_state(state)
 
     def _kcp_output(self, data: bytes, _kcp: KCP, _user: Any) -> int:
-        """KCP 输出回调 - 将 KCP 段通过 UDP 发送"""
+        """KCP 输出回调 - 将 KCP 段通过 UDP 发送
+
+        该回调在事件循环中同步执行，须避免 sendto 因发送缓冲满而阻塞。
+        若非阻塞套接字，则捕获 BlockingIOError/InterruptedError 并返回失败，
+        由 KCP 层负责重传，绝不阻塞事件循环。
+        """
         try:
             if self._sock and self._remote_addr:
-                self._sock.sendto(data, self._remote_addr)
-                self.stats.bytes_sent += len(data)
+                sent = self._sock.sendto(data, self._remote_addr)
+                self.stats.bytes_sent += sent
                 self.stats.packets_sent += 1
-                return len(data)
+                return sent
+        except (BlockingIOError, InterruptedError):
+            # 发送缓冲满/被信号中断：本次不发送，等待 KCP 后续重传，避免阻塞
+            return -1
         except Exception as e:
             logger.error(f"[KCP] Send error: {e}")
         return -1
