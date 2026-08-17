@@ -46,7 +46,7 @@ class KcpConfig:
     sndwnd: int = 1024
     rcvwnd: int = 1024
     # MTU
-    mtu: int = 1400
+    mtu: int = 1500
 
 
 @dataclass
