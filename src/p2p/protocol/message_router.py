@@ -17,7 +17,7 @@ from typing import Any
 
 from loguru import logger
 
-from .types import Message
+from ..types import Message
 
 
 class OrderedMessageRouter:

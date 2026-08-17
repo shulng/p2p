@@ -15,7 +15,7 @@ import base64
 import json
 from typing import Any
 
-from .types import Message, MessageType
+from ..types import Message, MessageType
 
 
 def encode_payload(payload: Any) -> Any:

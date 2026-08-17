@@ -23,8 +23,8 @@ from .config import (
     TransportProtocol,
 )
 from .ice.ice_manager import IceManager
-from .message_codec import decode_message, encode_message
-from .message_router import OrderedMessageRouter
+from .protocol.message_codec import decode_message, encode_message
+from .protocol.message_router import OrderedMessageRouter
 from .signaling.client import SignalingClient, SignalingEvents
 from .transport.hybrid import CHANNEL_CONTROL, CHANNEL_DATA, KCPDataTransport
 from .types import (
