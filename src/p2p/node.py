@@ -425,10 +425,6 @@ class P2PNode:
         # 等待地址交换完成(INITIATOR 会自动发起直连)
         await kcp_transport.wait_for_addr_exchange(timeout=10.0)
 
-    def _get_kcp_transport(self, peer_id: str) -> KCPDataTransport | None:
-        """获取指定 peer 的 KCP 传输实例"""
-        return self._kcp_transports.get(peer_id)
-
     async def send_to_peer_kcp(
         self, peer_id: str, data: bytes, channel: str = CHANNEL_DATA
     ) -> bool:

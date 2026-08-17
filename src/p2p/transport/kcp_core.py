@@ -34,11 +34,6 @@ def _get_mss(mtu: int) -> int:
     return mtu - KCP_OVERHEAD
 
 
-def _bound(low: int, x: int, high: int) -> int:
-    """限制值在范围内"""
-    return max(low, min(x, high))
-
-
 def _seq_wrap(seq: int) -> int:
     """将序号限制在 32 位无符号范围内，模拟 KCP C 版的 uint32 回绕。"""
     return seq & 0xFFFFFFFF
@@ -690,23 +685,6 @@ class KCP:
 
         return next_flush
 
-    def check(self, current: int | None = None) -> bool:
-        """
-        检查是否需要调用 update
-        """
-        if current is None:
-            self.current = _itime_now()
-        else:
-            self.current = current & 0xFFFFFFFF
-
-        if not self.updated:
-            return True
-
-        if self.current - self.ts_flush >= self.interval:
-            return True
-
-        return any(self.current - seg.resendts >= 0 for seg in self.snd_buf)
-
     def recv(self, maxlen: int) -> bytes:
         """
         接收数据
@@ -773,11 +751,3 @@ class KCP:
         获取等待发送的包数
         """
         return len(self.snd_buf) + len(self.snd_queue)
-
-    def set_user(self, user: object) -> None:
-        """设置用户数据"""
-        self.user = user
-
-    def get_user(self) -> object:
-        """获取用户数据"""
-        return self.user

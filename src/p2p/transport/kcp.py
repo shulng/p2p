@@ -121,11 +121,8 @@ class KCPTransport:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setblocking(False)
 
-        if port == 0:
-            # 让系统自动分配可用端口，避免冲突
-            self._sock.bind((host, 0))
-        else:
-            self._sock.bind((host, port))
+        # port==0 时由系统自动分配可用端口，避免冲突
+        self._sock.bind((host, port))
 
         self._local_addr = self._sock.getsockname()
         logger.info(f"[KCP] Bound to {self._local_addr}")
@@ -321,16 +318,6 @@ class KCPTransport:
             return True
         except Exception as e:
             logger.error(f"[KCP] Send queue error: {e}")
-            return False
-
-    def send_sync(self, data: bytes) -> bool:
-        """同步发送（立即放入队列，不等待）"""
-        if self.state != ConnectionState.CONNECTED:
-            return False
-        try:
-            self._send_queue.put_nowait(data)
-            return True
-        except Exception:
             return False
 
     async def close(self) -> None:
