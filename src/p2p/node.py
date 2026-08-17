@@ -428,16 +428,21 @@ class P2PNode:
         # 等待地址交换完成(INITIATOR 会自动发起直连)
         await kcp_transport.wait_for_addr_exchange(timeout=10.0)
 
-    async def send_to_peer_kcp(
-        self, peer_id: str, data: bytes, channel: str = CHANNEL_DATA
-    ) -> bool:
-        """通过 KCP 传输发送数据
+    async def _send_raw_to_peer(self, peer_id: str, data: bytes, channel: str) -> bool:
+        """按通道类型将已编码的原始字节发送给指定 peer
 
         Args:
             peer_id: 目标 peer
-            data: 数据
+            data: 已序列化的原始数据
             channel: CHANNEL_CONTROL / CHANNEL_DATA
+
+        通道策略由传输层内部决定：data 优先 KCP、失败降级 SCTP；
+        control 固定走 SCTP/DataChannel。
         """
+        if peer_id not in self._peers:
+            logger.warning(f"[P2PNode] Unknown peer: {peer_id}")
+            return False
+
         kcp_transport = self._kcp_transports.get(peer_id)
         if kcp_transport:
             return await kcp_transport.send(data, channel)
@@ -447,37 +452,13 @@ class P2PNode:
             return await ice.send_data(data)
         return False
 
-    async def send_to_peer_channel(
-        self,
-        peer_id: str,
-        msg_type: MessageType,
-        payload: Any,
-        channel: str = CHANNEL_DATA,
-    ) -> bool:
-        """序列化 Message 后通过指定通道发送
-
-        Args:
-            peer_id: 目标 peer
-            msg_type: 消息类型
-            payload: 消息负载
-            channel: CHANNEL_CONTROL / CHANNEL_DATA
-        """
-        msg = Message.create(
-            msg_type=msg_type,
-            sender_id=self.peer_id,
-            receiver_id=peer_id,
-            payload=payload,
-        )
-        data = self._encode_message(msg)
-        return await self.send_to_peer_kcp(peer_id, data, channel)
-
     async def send_control(self, peer_id: str, payload: Any) -> bool:
         """通过 control 通道发送控制消息（走 SCTP/DataChannel）。
 
         供应用层表达「这是控制消息」的语义，通道由传输层内部映射为
         CHANNEL_CONTROL，应用层无需感知具体通道常量。
         """
-        return await self.send_to_peer_channel(
+        return await self.send_to_peer(
             peer_id, MessageType.DATA_JSON, payload, channel=CHANNEL_CONTROL
         )
 
@@ -487,7 +468,7 @@ class P2PNode:
         供应用层表达「这是数据消息」的语义，通道由传输层内部映射为
         CHANNEL_DATA，应用层无需感知具体通道常量。
         """
-        return await self.send_to_peer_channel(
+        return await self.send_to_peer(
             peer_id, MessageType.DATA_JSON, payload, channel=CHANNEL_DATA
         )
 
@@ -652,21 +633,19 @@ class P2PNode:
         peer_id: str,
         msg_type: MessageType,
         payload: Any = None,
-        _prefer_transport: TransportProtocol | None = None,
+        channel: str = CHANNEL_DATA,
     ) -> bool:
-        """发送消息到指定 Peer (通过该 peer 的 ICE DataChannel)
+        """发送消息到指定 Peer
+
+        统一发送入口：将 ``Message`` 序列化后，按 ``channel`` 交由传输层发送。
+        data 通道优先 KCP、失败降级 SCTP；control 通道固定走 SCTP/DataChannel。
 
         Args:
             peer_id: 目标 peer 标识。
             msg_type: 消息类型。
             payload: 消息负载。
-            _prefer_transport: 预留的传输偏好参数（当前固定走 ICE
-                DataChannel，保留以维持 API 契约）。
+            channel: CHANNEL_DATA / CHANNEL_CONTROL。
         """
-        if peer_id not in self._peers:
-            logger.warning(f"[P2PNode] Unknown peer: {peer_id}")
-            return False
-
         msg = Message.create(
             msg_type=msg_type,
             sender_id=self.peer_id,
@@ -674,25 +653,18 @@ class P2PNode:
             payload=payload,
         )
         data = self._encode_message(msg)
-
-        # 通过该 peer 的独立 IceManager DataChannel 发送
-        ice = self._ice_managers.get(peer_id)
-        if ice:
-            return await ice.send_data(data)
-
-        logger.warning(f"[P2PNode] No IceManager for {peer_id}")
-        return False
+        return await self._send_raw_to_peer(peer_id, data, channel)
 
     async def send_text(self, peer_id: str, text: str) -> bool:
-        """发送文本消息"""
+        """发送文本消息（走 data 通道，KCP 优先）"""
         return await self.send_to_peer(peer_id, MessageType.DATA_TEXT, text)
 
     async def send_json(self, peer_id: str, obj: Any) -> bool:
-        """发送 JSON 数据"""
+        """发送 JSON 数据（走 data 通道，KCP 优先）"""
         return await self.send_to_peer(peer_id, MessageType.DATA_JSON, obj)
 
     async def send_bytes(self, peer_id: str, data: bytes) -> bool:
-        """发送二进制数据"""
+        """发送二进制数据（走 data 通道，KCP 优先）"""
         return await self.send_to_peer(peer_id, MessageType.DATA_BINARY, data)
 
     def get_connected_peers(self) -> list[str]:

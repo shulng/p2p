@@ -35,7 +35,7 @@
 | `control` | 隧道控制消息（open/close） | SCTP (DataChannel) |
 | `data` | 业务数据（隧道 TCP/UDP 数据） | KCP 直连优先，降级 SCTP |
 
-> 说明：`chat` / `bench` 命令通过 `send_text` / `send_bytes`（走 SCTP/DataChannel）发送；`server` / `client` 隧道的数据消息通过 `send_to_peer_channel(channel=CHANNEL_DATA)` 走 **KCP 直连优先、SCTP 降级**。
+> 说明：所有数据消息（`send_text` / `send_bytes` / `send_data` 及 `server` / `client` 隧道数据）统一走 **KCP 直连优先、SCTP 降级**；控制消息（`send_control`，如隧道 open/close）固定走 SCTP/DataChannel。
 
 **数据流向(游戏隧道)**:
 
@@ -364,7 +364,7 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 初始化流程:`initialize()` → `connect_to_signaling()` → `join_room()` → `connect_to_peer()`。
 
-> 注意：`send_to_peer` / `send_text` / `send_bytes` 走 SCTP(DataChannel)；`send_to_peer_channel(channel=CHANNEL_DATA)` 走 KCP 优先、SCTP 降级。
+> 注意：所有数据消息（`send_to_peer` / `send_text` / `send_bytes` / `send_data`，默认 data 通道）走 KCP 优先、SCTP 降级；控制消息（`send_control`，control 通道）固定走 SCTP(DataChannel)。
 
 ### tunnel/game_tunnel.py
 
@@ -383,7 +383,7 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 - **control** 信令走 SCTP (DataChannel)
 - **data** 数据优先走 **KCP**(纯 Python 实现,fast 模式低延迟,适合实时游戏),KCP 直连不可用(如严格 NAT 下 KCP 无法直连)时自动降级到 SCTP
 
-> 简单文本/二进制消息(`chat`/`bench` 及 `send_text`/`send_bytes`/`send_to_peer`)直接走 DataChannel(SCTP)；隧道数据(`GameTunnel`)走 KCP 优先。
+> 所有数据消息（`chat`/`bench` 及 `send_text`/`send_bytes`/`send_to_peer`/`send_data` 与隧道数据）统一走 data 通道：KCP 直连优先、失败降级 SCTP(DataChannel)。
 
 ### Cloudflare TURN
 
