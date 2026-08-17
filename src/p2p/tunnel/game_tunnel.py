@@ -556,9 +556,14 @@ class GameTunnel:
             )
 
     def _on_peer_connected(self, peer_info: PeerInfo) -> None:
-        """P2P 对端连接成功（支持多 peer）"""
+        """P2P 对端连接成功（支持多 peer）
+
+        注意：``_peer_id`` 作为 CLIENT 端单 peer 数据路由的目标。当首个 peer
+        断开后（_on_peer_disconnected 已将其置空），此处必须用新 peer 更新，
+        否则数据仍会路由到已失效的旧 peer_id，导致重连后隧道「假死」。
+        """
         if self._peer_id is None:
-            self._peer_id = peer_info.peer_id  # 首个 peer
+            self._peer_id = peer_info.peer_id  # 首个 peer 或重连后的首个 peer
         self._peer_ids.add(peer_info.peer_id)
         self._connected = True
         self._peer_connected_event.set()
@@ -570,6 +575,10 @@ class GameTunnel:
         """P2P 对端断开（清理该 peer 相关的隧道与映射）"""
         self._peer_ids.discard(peer_id)
         self._connected = len(self._peer_ids) > 0
+        # 若断开的是当前路由目标，将其置空，使重连时 _on_peer_connected 能更新为
+        # 新 peer（否则 _send_tunnel_message 会一直路由到已失效的旧 peer_id）。
+        if self._peer_id == peer_id:
+            self._peer_id = None
         logger.warning(
             f"[Tunnel] P2P disconnected from {peer_id} (remaining peers: {len(self._peer_ids)})"
         )

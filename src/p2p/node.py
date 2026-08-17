@@ -502,7 +502,12 @@ class P2PNode:
             and peer.peer_id not in self._peers
         ):
             logger.info(f"[P2PNode] Auto-connecting to responder {peer.peer_id}")
-            connect_task = asyncio.create_task(self.connect_to_peer(peer.peer_id))
+            # 带重试的自动连接：首次握手可能因信令/ICE 时序等瞬时因素失败，
+            # 若失败不重试，已运行的客户端将永远无法重新连上重启后的房间服务端
+            # （表现为"必须重启客户端才能连上"）。这里以指数退避重试若干次。
+            connect_task = asyncio.create_task(
+                self._auto_connect_with_retry(peer.peer_id, max_retries=3)
+            )
 
             def _log_connect_error(t: asyncio.Task[Any]) -> None:
                 if t.cancelled():
@@ -512,6 +517,40 @@ class P2PNode:
                     logger.error(f"[P2PNode] Auto-connect to {peer.peer_id} failed: {exc}")
 
             connect_task.add_done_callback(_log_connect_error)
+
+    async def _auto_connect_with_retry(self, target_peer_id: str, max_retries: int = 3) -> None:
+        """对自动连接进行指数退避重试。
+
+        ``connect_to_peer`` 内部失败时会清理该 peer 的中间状态（_fail_peer_connection），
+        因此重试是安全的。一旦成功或对端已离开，即停止。
+        """
+        attempt = 0
+        while attempt <= max_retries and self._running:
+            # 已连上或对端已断开（例如又被 room_info 移除），停止重试
+            if target_peer_id in self._peers:
+                return
+            if not self._signaling or not self._signaling.is_connected:
+                return
+            if attempt > 0:
+                delay = 1.0 * (2 ** (attempt - 1))  # 1s, 2s, 4s...
+                logger.info(
+                    f"[P2PNode] Retrying auto-connect to {target_peer_id} "
+                    f"(attempt {attempt}/{max_retries}) in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                # 等待期间对端可能又断开了
+                if target_peer_id in self._peers or not self._signaling.is_connected:
+                    return
+            ok = await self.connect_to_peer(target_peer_id)
+            if ok:
+                logger.info(f"[P2PNode] Auto-connect to {target_peer_id} succeeded")
+                return
+            attempt += 1
+        if self._running:
+            logger.error(
+                f"[P2PNode] Auto-connect to {target_peer_id} failed after "
+                f"{max_retries + 1} attempts"
+            )
 
     async def _signal_on_peer_left(self, peer_id: str) -> None:
         """Peer 离开房间（幂等：复用 _cleanup_and_notify，与 ICE 断开路径一致）"""

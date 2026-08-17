@@ -84,6 +84,7 @@ class SignalingConfig:
     reconnect_interval: float = 2.0
     max_reconnect_attempts: int = 10
     room_id: str | None = None
+    room_role: ConnectionRole = ConnectionRole.INITIATOR
     peer_id: str | None = None
 
 

@@ -101,10 +101,15 @@ class SignalingClient:
 
             logger.info(f"[SignalingClient] Connected as {self.peer_id}")
 
-            _dispatch(self.events.on_connected)
-
-            # 启动接收循环
+            # 启动接收循环（re-join 需要收到 JOIN 确认，必须先启动接收）
             self._recv_task = asyncio.create_task(self._recv_loop())
+
+            # 断线重连后，需要重新加入房间，否则仅连上信令服务器而无法收到
+            # 房间内的 peer 更新（导致对端重连后本节点感知不到、无法恢复连接）。
+            if self.config.room_id:
+                await self._rejoin_room()
+
+            _dispatch(self.events.on_connected)
 
             return True
 
@@ -113,6 +118,29 @@ class SignalingClient:
             await self._schedule_reconnect()
             return False
 
+    async def _rejoin_room(self) -> None:
+        """重连信令服务器后重新加入已加入的房间（在加入前重置 join 事件）"""
+        room_id = self.config.room_id
+        if not room_id:
+            return
+        self._join_event = asyncio.Event()
+        try:
+            await self._send(
+                {
+                    "type": MessageType.SIGNAL_JOIN.value,
+                    "peer_id": self.peer_id,
+                    "room_id": room_id,
+                    "role": self.config.room_role.value,
+                }
+            )
+            try:
+                await asyncio.wait_for(self._join_event.wait(), timeout=10.0)
+                logger.info(f"[SignalingClient] Re-joined room {room_id}")
+            except asyncio.TimeoutError:
+                logger.warning("[SignalingClient] Re-join room timeout")
+        except Exception as e:
+            logger.error(f"[SignalingClient] Re-join room error: {e}")
+
     async def join_room(
         self,
         room_id: str,
@@ -120,6 +148,7 @@ class SignalingClient:
     ) -> bool:
         """加入房间"""
         self.config.room_id = room_id
+        self.config.room_role = role
 
         try:
             await self._send(
