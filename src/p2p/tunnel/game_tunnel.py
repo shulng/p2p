@@ -9,27 +9,30 @@
   - UDP 流量转发（如 Minecraft Bedrock、饥荒联机版）
   - 同时转发 TCP + UDP（both 模式，端口可独立配置）
 """
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, cast
+
 from loguru import logger
 
-from .config import P2PConfig, TransportProtocol, ConnectionRole, IceConfig
-from .node import P2PNode
-from .types import Message, MessageType, ConnectionState
-from .hybrid_transport import CHANNEL_CONTROL, CHANNEL_DATA
-
+from ..config import ConnectionRole, P2PConfig
+from ..node import P2PNode
+from ..transport.hybrid import CHANNEL_CONTROL, CHANNEL_DATA
+from ..types import Message, MessageType, PeerInfo
 
 # 隧道消息类型（复用 Message 结构，payload 为 dict）
-TUNNEL_TCP_OPEN = "tunnel.tcp.open"     # 打开 TCP 隧道
-TUNNEL_TCP_CLOSE = "tunnel.tcp.close"   # 关闭 TCP 隧道
-TUNNEL_TCP_DATA = "tunnel.tcp.data"     # TCP 隧道数据
-TUNNEL_UDP_DATA = "tunnel.udp.data"     # UDP 数据（双向）
-TUNNEL_UDP_CLOSE = "tunnel.udp.close"   # 关闭 UDP 会话
+TUNNEL_TCP_OPEN = "tunnel.tcp.open"  # 打开 TCP 隧道
+TUNNEL_TCP_CLOSE = "tunnel.tcp.close"  # 关闭 TCP 隧道
+TUNNEL_TCP_DATA = "tunnel.tcp.data"  # TCP 隧道数据
+TUNNEL_UDP_DATA = "tunnel.udp.data"  # UDP 数据（双向）
+TUNNEL_UDP_CLOSE = "tunnel.udp.close"  # 关闭 UDP 会话
 
 # UDP 会话空闲超时（秒），超时后清理 HOST 端的 relay
 UDP_SESSION_TIMEOUT = 60.0
@@ -38,6 +41,7 @@ UDP_SESSION_TIMEOUT = 60.0
 @dataclass
 class TunnelConfig:
     """通用隧道配置"""
+
     # 本地监听地址（CLIENT 端，用户/游戏客户端连接这里）
     local_listen_host: str = "127.0.0.1"
     local_listen_port: int = 0  # TCP 监听端口，0 表示必填
@@ -50,8 +54,8 @@ class TunnelConfig:
     protocol: str = "tcp"
 
     # UDP 专用端口（可选，both 模式下 TCP/UDP 可用不同端口；None 时与 TCP 端口相同）
-    local_listen_port_udp: Optional[int] = None
-    remote_forward_port_udp: Optional[int] = None
+    local_listen_port_udp: int | None = None
+    remote_forward_port_udp: int | None = None
 
     # 隧道名称（仅用于日志显示）
     name: str = "tunnel"
@@ -65,15 +69,16 @@ class _UdpClientProtocol(asyncio.DatagramProtocol):
 
     def __init__(
         self,
-        on_datagram: Callable[[Tuple[str, int], bytes], None],
+        on_datagram: Callable[[tuple[str, int], bytes], None],
     ):
         self.on_datagram = on_datagram
-        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.transport: asyncio.DatagramTransport | None = None
 
-    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-        self.transport = transport
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        # create_datagram_endpoint 创建的 transport 始终是 DatagramTransport
+        self.transport = cast(asyncio.DatagramTransport, transport)
 
-    def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.on_datagram(addr, data)
 
     def error_received(self, exc: Exception) -> None:
@@ -96,21 +101,22 @@ class _UdpRelayProtocol(asyncio.DatagramProtocol):
         self.conn_id = conn_id
         self.on_datagram = on_datagram
         self.on_close = on_close
-        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.transport: asyncio.DatagramTransport | None = None
         self.last_activity: float = time.monotonic()
 
-    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-        self.transport = transport
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        # create_datagram_endpoint 创建的 transport 始终是 DatagramTransport
+        self.transport = cast(asyncio.DatagramTransport, transport)
         self.last_activity = time.monotonic()
 
-    def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.last_activity = time.monotonic()
         self.on_datagram(self.conn_id, data)
 
     def error_received(self, exc: Exception) -> None:
         logger.error(f"[Tunnel-UDP] Relay error #{self.conn_id}: {exc}")
 
-    def connection_lost(self, exc: Optional[Exception]) -> None:
+    def connection_lost(self, exc: Exception | None) -> None:
         self.on_close(self.conn_id)
 
 
@@ -133,27 +139,29 @@ class GameTunnel:
         self.role = role
 
         # TCP 隧道: conn_id -> (reader, writer)
-        self._tcp_tunnels: Dict[str, Tuple[Optional[asyncio.StreamReader], Optional[asyncio.StreamWriter]]] = {}
+        self._tcp_tunnels: dict[
+            str, tuple[asyncio.StreamReader | None, asyncio.StreamWriter | None]
+        ] = {}
         # TCP 隧道建立前的数据缓冲: conn_id -> list[bytes]
-        self._tcp_pending: Dict[str, list] = {}
+        self._tcp_pending: dict[str, list[bytes]] = {}
 
         # UDP 会话 (CLIENT 端): client_addr -> conn_id, conn_id -> client_addr
-        self._udp_client_to_conn: Dict[Tuple[str, int], str] = {}
-        self._udp_conn_to_client: Dict[str, Tuple[str, int]] = {}
+        self._udp_client_to_conn: dict[tuple[str, int], str] = {}
+        self._udp_conn_to_client: dict[str, tuple[str, int]] = {}
 
         # UDP 会话 (HOST 端): conn_id -> _UdpRelayProtocol
-        self._udp_relays: Dict[str, _UdpRelayProtocol] = {}
+        self._udp_relays: dict[str, _UdpRelayProtocol] = {}
 
         # 本地服务器
-        self._tcp_server: Optional[asyncio.AbstractServer] = None
-        self._udp_listen_transport: Optional[asyncio.DatagramTransport] = None
-        self._udp_cleanup_task: Optional[asyncio.Task] = None
+        self._tcp_server: asyncio.AbstractServer | None = None
+        self._udp_listen_transport: asyncio.DatagramTransport | None = None
+        self._udp_cleanup_task: asyncio.Task[Any] | None = None
 
         # P2P 节点
-        self._node: Optional[P2PNode] = None
-        self._peer_id: Optional[str] = None  # 首个连接的 peer（CLIENT 端单 peer 用）
-        self._peer_ids: set = set()  # 所有已连接的 peer（HOST 端多 peer 用）
-        self._conn_to_peer: Dict[str, str] = {}  # conn_id -> peer_id（回包路由）
+        self._node: P2PNode | None = None
+        self._peer_id: str | None = None  # 首个连接的 peer（CLIENT 端单 peer 用）
+        self._peer_ids: set[str] = set()  # 所有已连接的 peer（HOST 端多 peer 用）
+        self._conn_to_peer: dict[str, str] = {}  # conn_id -> peer_id（回包路由）
         self._connected: bool = False
         self._peer_connected_event: asyncio.Event = asyncio.Event()
 
@@ -161,8 +169,14 @@ class GameTunnel:
         self._bytes_forwarded: int = 0
         self._connections_count: int = 0
 
-    async def start(self, signaling_url: str, room_id: str) -> None:
-        """启动隧道"""
+    async def start(self, _signaling_url: str, room_id: str) -> None:
+        """启动隧道
+
+        Args:
+            _signaling_url: 信令服务器地址（当前由内部 P2PNode 配置驱动，
+                该参数保留以维持调用方接口契约）。
+            room_id: 要加入的房间 ID。
+        """
         proto = self.tunnel_config.protocol.lower()
         logger.info(f"=== Tunnel Starting ({self.role.value}) ===")
         logger.info(f"Name: {self.tunnel_config.name} | Protocol: {proto.upper()}")
@@ -290,10 +304,8 @@ class GameTunnel:
         finally:
             await self._send_tunnel_message(TUNNEL_TCP_CLOSE, conn_id, b"")
             writer.close()
-            try:
+            with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            except Exception:
-                pass
             self._tcp_tunnels.pop(conn_id, None)
             logger.info(f"[Tunnel-TCP] Local connection #{conn_id} closed")
 
@@ -324,7 +336,9 @@ class GameTunnel:
             self._conn_to_peer.pop(conn_id, None)
             await self._send_tunnel_message(TUNNEL_TCP_CLOSE, conn_id, b"")
 
-    async def _forward_tcp_local_to_remote(self, conn_id: str, reader: asyncio.StreamReader) -> None:
+    async def _forward_tcp_local_to_remote(
+        self, conn_id: str, reader: asyncio.StreamReader
+    ) -> None:
         """HOST 端：从本地目标服务读取数据，转发到远端"""
         try:
             while conn_id in self._tcp_tunnels:
@@ -367,8 +381,8 @@ class GameTunnel:
             try:
                 tunnel[1].close()
                 await tunnel[1].wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[Tunnel-TCP] Error closing #{conn_id}: {e}")
             logger.info(f"[Tunnel-TCP] Connection #{conn_id} closed by remote")
 
     # ========== UDP 转发 ==========
@@ -376,7 +390,7 @@ class GameTunnel:
     async def _start_local_udp_server(self) -> None:
         """CLIENT 端：启动本地 UDP 监听"""
         loop = asyncio.get_event_loop()
-        transport, protocol = await loop.create_datagram_endpoint(
+        transport, _ = await loop.create_datagram_endpoint(
             lambda: _UdpClientProtocol(on_datagram=self._on_local_udp_datagram),
             local_addr=(self.tunnel_config.local_listen_host, self._local_udp_port()),
         )
@@ -386,7 +400,7 @@ class GameTunnel:
             f"{self.tunnel_config.local_listen_host}:{self._local_udp_port()}"
         )
 
-    def _on_local_udp_datagram(self, addr: Tuple[str, int], data: bytes) -> None:
+    def _on_local_udp_datagram(self, addr: tuple[str, int], data: bytes) -> None:
         """CLIENT 端：收到本地 UDP 客户端数据包"""
         conn_id = self._udp_client_to_conn.get(addr)
         if conn_id is None:
@@ -419,7 +433,7 @@ class GameTunnel:
                 # 创建新的 UDP relay 连接到本地目标
                 try:
                     loop = asyncio.get_event_loop()
-                    transport, protocol = await loop.create_datagram_endpoint(
+                    _, protocol = await loop.create_datagram_endpoint(
                         lambda: _UdpRelayProtocol(
                             conn_id=conn_id,
                             on_datagram=self._on_udp_relay_datagram,
@@ -442,7 +456,8 @@ class GameTunnel:
 
             relay.last_activity = time.monotonic()
             self._bytes_forwarded += len(data)
-            relay.transport.sendto(data)
+            if relay.transport:
+                relay.transport.sendto(data)
 
     def _on_udp_relay_datagram(self, conn_id: str, data: bytes) -> None:
         """HOST 端：本地目标服务回包 -> 通过 P2P 转发回 CLIENT"""
@@ -461,7 +476,8 @@ class GameTunnel:
             await asyncio.sleep(10)
             now = time.monotonic()
             expired = [
-                cid for cid, relay in self._udp_relays.items()
+                cid
+                for cid, relay in self._udp_relays.items()
                 if now - relay.last_activity > UDP_SESSION_TIMEOUT
             ]
             for cid in expired:
@@ -527,7 +543,7 @@ class GameTunnel:
         if tunnel_type in (TUNNEL_TCP_DATA, TUNNEL_UDP_DATA):
             channel = CHANNEL_DATA  # 数据 → KCP
         else:
-            channel = CHANNEL_CONTROL   # 控制信令 → SCTP
+            channel = CHANNEL_CONTROL  # 控制信令 → SCTP
 
         await self._node.send_to_peer_channel(
             peer_id,
@@ -540,7 +556,7 @@ class GameTunnel:
             channel=channel,
         )
 
-    def _on_peer_connected(self, peer_info) -> None:
+    def _on_peer_connected(self, peer_info: PeerInfo) -> None:
         """P2P 对端连接成功（支持多 peer）"""
         if self._peer_id is None:
             self._peer_id = peer_info.peer_id  # 首个 peer
@@ -548,8 +564,7 @@ class GameTunnel:
         self._connected = True
         self._peer_connected_event.set()
         logger.success(
-            f"[Tunnel] P2P connected to {peer_info.peer_id} "
-            f"(total peers: {len(self._peer_ids)})"
+            f"[Tunnel] P2P connected to {peer_info.peer_id} (total peers: {len(self._peer_ids)})"
         )
 
     def _on_peer_disconnected(self, peer_id: str) -> None:
@@ -557,8 +572,7 @@ class GameTunnel:
         self._peer_ids.discard(peer_id)
         self._connected = len(self._peer_ids) > 0
         logger.warning(
-            f"[Tunnel] P2P disconnected from {peer_id} "
-            f"(remaining peers: {len(self._peer_ids)})"
+            f"[Tunnel] P2P disconnected from {peer_id} (remaining peers: {len(self._peer_ids)})"
         )
         # 清理该 peer 的 conn_id -> peer_id 映射，并关闭对应隧道
         for conn_id, pid in list(self._conn_to_peer.items()):
@@ -573,14 +587,16 @@ class GameTunnel:
             for conn_id in list(self._udp_relays.keys()):
                 asyncio.create_task(self._handle_remote_udp_close(conn_id))
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """获取隧道统计"""
         return {
             "connected": self._connected,
             "peer_id": self._peer_id,
             "peer_count": len(self._peer_ids),
             "active_tcp": len(self._tcp_tunnels),
-            "active_udp": len(self._udp_relays) if self.role == ConnectionRole.RESPONDER else len(self._udp_conn_to_client),
+            "active_udp": len(self._udp_relays)
+            if self.role == ConnectionRole.RESPONDER
+            else len(self._udp_conn_to_client),
             "total_connections": self._connections_count,
             "bytes_forwarded": self._bytes_forwarded,
             "bytes_forwarded_mb": round(self._bytes_forwarded / 1024 / 1024, 2),
@@ -591,23 +607,19 @@ class GameTunnel:
         logger.info("[Tunnel] Stopping...")
 
         # 关闭所有 TCP 隧道
-        for conn_id, (reader, writer) in list(self._tcp_tunnels.items()):
+        for _, (_, writer) in list(self._tcp_tunnels.items()):
             if writer:
-                try:
+                with contextlib.suppress(Exception):
                     writer.close()
                     await writer.wait_closed()
-                except Exception:
-                    pass
         self._tcp_tunnels.clear()
         self._tcp_pending.clear()
 
         # 关闭 UDP relay
         for relay in self._udp_relays.values():
             if relay.transport:
-                try:
+                with contextlib.suppress(Exception):
                     relay.transport.close()
-                except Exception:
-                    pass
         self._udp_relays.clear()
         self._udp_client_to_conn.clear()
         self._udp_conn_to_client.clear()
@@ -617,10 +629,8 @@ class GameTunnel:
         # 关闭 UDP 清理任务
         if self._udp_cleanup_task:
             self._udp_cleanup_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._udp_cleanup_task
-            except asyncio.CancelledError:
-                pass
 
         # 关闭本地 TCP 服务器
         if self._tcp_server:

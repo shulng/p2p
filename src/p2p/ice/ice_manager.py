@@ -1,26 +1,50 @@
 """ICE 管理模块 - 集成 TURN (支持 Cloudflare TURN: turn.cloudflare.com:3478)"""
+
 from __future__ import annotations
 
 import asyncio
-import json
-from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Dict, Any, Tuple
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
 from loguru import logger
 
-try:
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+# 仅在类型检查阶段无条件导入 aiortc 符号，避免基于 pyright 在
+# try/except ImportError 场景下报"可能未绑定"；运行时该块不执行。
+if TYPE_CHECKING:
+    from aiortc import (
+        RTCDataChannel,
+        RTCPeerConnection,
+        RTCSessionDescription,
+    )
     from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
-    AIORTC_AVAILABLE = True
+    from aiortc.sdp import candidate_from_sdp
+
+try:
+    from aiortc import (
+        RTCDataChannel,
+        RTCPeerConnection,
+        RTCSessionDescription,
+    )
+    from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
+    from aiortc.sdp import candidate_from_sdp
+
+    _aiortc_import_ok = True
 except ImportError:
-    AIORTC_AVAILABLE = False
+    _aiortc_import_ok = False
     logger.warning("aiortc not installed, ICE/TURN features will be limited")
 
-from .config import IceConfig, TurnServerConfig
-from .types import (
+# 供模块内使用的功能开关：try/except 中不允许对全大写"常量"赋值两次，
+# 因此先用小写变量承载导入状态，再一次性赋值给对外常量，消除重定义告警。
+AIORTC_AVAILABLE: bool = _aiortc_import_ok
+
+from ..config import IceConfig
+from ..types import (
     ConnectionState,
     SessionDescription,
-    IceCandidate as LocalIceCandidate,
     generate_peer_id,
+)
+from ..types import (
+    IceCandidate as LocalIceCandidate,
 )
 
 
@@ -30,29 +54,29 @@ class IceManager:
     def __init__(
         self,
         config: IceConfig,
-        on_ice_candidate: Optional[Callable[[LocalIceCandidate], None]] = None,
-        on_connection_state: Optional[Callable[[ConnectionState], None]] = None,
-        on_ice_gathering_done: Optional[Callable[[], None]] = None,
-        on_remote_address: Optional[Callable[[Tuple[str, int]], None]] = None,
+        on_ice_candidate: Callable[[LocalIceCandidate], None] | None = None,
+        on_connection_state: Callable[[ConnectionState], None] | None = None,
+        on_ice_gathering_done: Callable[[], None] | None = None,
+        on_remote_address: Callable[[tuple[str, int]], None] | None = None,
     ):
         self.config = config
         self.on_ice_candidate = on_ice_candidate
         self.on_connection_state = on_connection_state
         self.on_ice_gathering_done = on_ice_gathering_done
         self.on_remote_address = on_remote_address
-        self.on_data_received: Optional[Callable[[bytes], None]] = None
+        self.on_data_received: Callable[[bytes], None] | None = None
 
         # 状态
         self.state: ConnectionState = ConnectionState.DISCONNECTED
-        self.ice_state: Optional[str] = None
+        self.ice_state: str | None = None
         self.gathering_done: bool = False
 
         # PeerConnection (aiortc)
-        self._pc: Optional["RTCPeerConnection"] = None
+        self._pc: RTCPeerConnection | None = None
         self._peer_id: str = generate_peer_id()
 
         # DataChannel
-        self._data_channel = None
+        self._data_channel: RTCDataChannel | None = None
         self._data_channel_open: asyncio.Event = asyncio.Event()
 
         # 事件
@@ -60,16 +84,17 @@ class IceManager:
         self._connected_event: asyncio.Event = asyncio.Event()
 
         # 收集到的候选地址
-        self.local_candidates: List[LocalIceCandidate] = []
-        self.remote_candidates: List[LocalIceCandidate] = []
+        self.local_candidates: list[LocalIceCandidate] = []
+        self.remote_candidates: list[LocalIceCandidate] = []
 
         # 选中的候选对
-        self.selected_local_candidate: Optional[LocalIceCandidate] = None
-        self.selected_remote_candidate: Optional[LocalIceCandidate] = None
-        self.selected_address: Optional[Tuple[str, int]] = None  # (host, port)
+        self.selected_local_candidate: LocalIceCandidate | None = None
+        self.selected_remote_candidate: LocalIceCandidate | None = None
+        self.selected_address: tuple[str, int] | None = None  # (host, port)
 
     @property
     def peer_id(self) -> str:
+        """当前 ICE 会话的 peer 标识。"""
         return self._peer_id
 
     def _set_state(self, state: ConnectionState) -> None:
@@ -80,27 +105,28 @@ class IceManager:
             if self.on_connection_state:
                 self.on_connection_state(state)
 
-    def _build_rtc_config(self) -> Optional["RTCConfiguration"]:
+    def _build_rtc_config(self) -> RTCConfiguration | None:
         """构建 aiortc RTCConfiguration"""
         if not AIORTC_AVAILABLE:
             return None
-        
-        ice_servers = []
+
+        ice_servers: list[RTCIceServer] = []
         for turn_cfg in self.config.ice_servers:
-            server_kwargs = {"urls": [turn_cfg.url]}
-            
-            if turn_cfg.username:
-                server_kwargs["username"] = turn_cfg.username
-            if turn_cfg.credential:
-                server_kwargs["credential"] = turn_cfg.credential
-            
-            ice_servers.append(RTCIceServer(**server_kwargs))
-        
+            # 单独构建可选的 str 字段，避免把 dict 整体标注为 `str | list[str]`
+            # 导致基于 pyright 将 username/credential 误判为 list[str] 而无法赋值。
+            ice_servers.append(
+                RTCIceServer(
+                    urls=[turn_cfg.url],
+                    **({"username": turn_cfg.username} if turn_cfg.username else {}),
+                    **({"credential": turn_cfg.credential} if turn_cfg.credential else {}),
+                )
+            )
+
         # 特别为 Cloudflare TURN 配置
         has_cloudflare = any(s.use_cloudflare for s in self.config.ice_servers)
         if has_cloudflare:
             logger.info("[ICE] Using Cloudflare TURN servers (turn.cloudflare.com:3478)")
-        
+
         return RTCConfiguration(iceServers=ice_servers)
 
     async def create_offer(self) -> SessionDescription:
@@ -109,15 +135,15 @@ class IceManager:
         """
         if not AIORTC_AVAILABLE:
             raise RuntimeError("aiortc not installed")
-        
+
         self._set_state(ConnectionState.CONNECTING)
-        
+
         rtc_config = self._build_rtc_config()
         self._pc = RTCPeerConnection(configuration=rtc_config)
-        
+
         # 注册事件
         self._register_events()
-        
+
         # 添加一个数据通道来触发 ICE 并用于数据传输
         try:
             self._data_channel = self._pc.createDataChannel("p2p-data", ordered=True)
@@ -125,13 +151,13 @@ class IceManager:
             logger.debug("[ICE] Created data channel 'p2p-data'")
         except Exception as e:
             logger.warning(f"[ICE] Could not create data channel: {e}")
-        
+
         # 创建 Offer
         offer = await self._pc.createOffer()
         await self._pc.setLocalDescription(offer)
-        
+
         logger.info("[ICE] Created SDP offer")
-        
+
         # 等待候选收集完成
         try:
             await asyncio.wait_for(
@@ -140,7 +166,7 @@ class IceManager:
             )
         except asyncio.TimeoutError:
             logger.warning("[ICE] ICE gathering timeout, using current candidates")
-        
+
         sdp = self._pc.localDescription
         return SessionDescription(sdp_type=sdp.type, sdp=sdp.sdp)
 
@@ -150,26 +176,26 @@ class IceManager:
         """
         if not AIORTC_AVAILABLE:
             raise RuntimeError("aiortc not installed")
-        
+
         self._set_state(ConnectionState.CONNECTING)
-        
+
         rtc_config = self._build_rtc_config()
         self._pc = RTCPeerConnection(configuration=rtc_config)
-        
+
         # 注册事件
         self._register_events()
-        
+
         # 处理远端 Offer
         await self._pc.setRemoteDescription(
             RTCSessionDescription(sdp=offer.sdp, type=offer.sdp_type)
         )
-        
+
         # 创建 Answer
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
-        
+
         logger.info("[ICE] Created SDP answer")
-        
+
         # 等待候选收集
         try:
             await asyncio.wait_for(
@@ -178,7 +204,7 @@ class IceManager:
             )
         except asyncio.TimeoutError:
             logger.warning("[ICE] ICE gathering timeout")
-        
+
         sdp = self._pc.localDescription
         return SessionDescription(sdp_type=sdp.type, sdp=sdp.sdp)
 
@@ -187,10 +213,8 @@ class IceManager:
         if not self._pc:
             logger.warning("[ICE] set_remote_description called without peer connection")
             return
-        
-        await self._pc.setRemoteDescription(
-            RTCSessionDescription(sdp=desc.sdp, type=desc.sdp_type)
-        )
+
+        await self._pc.setRemoteDescription(RTCSessionDescription(sdp=desc.sdp, type=desc.sdp_type))
         logger.info(f"[ICE] Remote description set, type={desc.sdp_type}")
 
     async def add_ice_candidate(self, candidate: LocalIceCandidate) -> None:
@@ -198,13 +222,9 @@ class IceManager:
         if not self._pc:
             logger.warning("[ICE] add_ice_candidate called without peer connection")
             return
-        
+
         try:
-            ice_candidate = RTCIceCandidate(
-                candidate=candidate.candidate,
-                sdpMid=candidate.sdp_mid,
-                sdpMLineIndex=candidate.sdp_mline_index,
-            )
+            ice_candidate = candidate_from_sdp(candidate.candidate)
             await self._pc.addIceCandidate(ice_candidate)
             self.remote_candidates.append(candidate)
             logger.debug(f"[ICE] Added remote candidate: {candidate.candidate[:60]}...")
@@ -213,11 +233,12 @@ class IceManager:
 
     def _register_events(self) -> None:
         """注册 aiortc 事件"""
-        if not self._pc:
+        pc = self._pc
+        if pc is None:
             return
-        
-        @self._pc.on("icecandidate")
-        async def on_ice_candidate(candidate):
+
+        @pc.on("icecandidate")
+        async def on_ice_candidate(candidate: Any) -> None:
             if candidate:
                 local_cand = LocalIceCandidate(
                     candidate=candidate.candidate,
@@ -225,10 +246,10 @@ class IceManager:
                     sdp_mline_index=candidate.sdpMLineIndex,
                 )
                 self.local_candidates.append(local_cand)
-                
+
                 if self.on_ice_candidate:
                     self.on_ice_candidate(local_cand)
-                    
+
                 logger.debug(f"[ICE] Local candidate: {candidate.candidate[:60]}...")
             else:
                 # None 候选 = 收集完成
@@ -238,12 +259,12 @@ class IceManager:
                 if self.on_ice_gathering_done:
                     self.on_ice_gathering_done()
 
-        @self._pc.on("iceconnectionstatechange")
-        async def on_ice_state_change():
-            state = self._pc.iceConnectionState
+        @pc.on("iceconnectionstatechange")
+        async def on_ice_state_change() -> None:
+            state = pc.iceConnectionState
             self.ice_state = state
             logger.info(f"[ICE] ICE connection state: {state}")
-            
+
             state_map = {
                 "new": ConnectionState.CONNECTING,
                 "checking": ConnectionState.CHECKING,
@@ -253,45 +274,46 @@ class IceManager:
                 "disconnected": ConnectionState.DISCONNECTED,
                 "closed": ConnectionState.CLOSED,
             }
-            
+
             mapped_state = state_map.get(state, ConnectionState.CONNECTING)
             self._set_state(mapped_state)
-            
+
             if state in ("connected", "completed"):
                 self._connected_event.set()
                 await self._extract_selected_candidates()
 
-        @self._pc.on("connectionstatechange")
-        async def on_connection_state():
-            state = self._pc.connectionState
+        @pc.on("connectionstatechange")
+        async def on_connection_state() -> None:
+            state = pc.connectionState
             logger.info(f"[ICE] Connection state: {state}")
 
-        @self._pc.on("datachannel")
-        def on_datachannel(channel):
+        @pc.on("datachannel")
+        def on_datachannel(channel: Any) -> None:
             logger.info(f"[ICE] Remote data channel received: {channel.label}")
             self._data_channel = channel
             self._register_data_channel_events(channel)
             # 如果 DataChannel 已经是 open 状态，直接设置事件
-            if hasattr(channel, 'readyState') and channel.readyState == "open":
+            if hasattr(channel, "readyState") and channel.readyState == "open":
                 logger.info("[ICE] DataChannel already open")
                 self._data_channel_open.set()
 
-    def _register_data_channel_events(self, channel) -> None:
+    def _register_data_channel_events(self, channel: Any) -> None:
         """注册 DataChannel 事件"""
-        @channel.on("open")
-        def on_open():
+
+        @channel.on("open")  # type: ignore[untyped-decorator]
+        def on_open() -> None:
             logger.info("[ICE] DataChannel opened")
             self._data_channel_open.set()
 
-        @channel.on("message")
-        def on_message(message):
+        @channel.on("message")  # type: ignore[untyped-decorator]
+        def on_message(message: Any) -> None:
             if isinstance(message, str):
                 message = message.encode("utf-8")
             if self.on_data_received:
                 self.on_data_received(message)
 
-        @channel.on("close")
-        def on_close():
+        @channel.on("close")  # type: ignore[untyped-decorator]
+        def on_close() -> None:
             logger.info("[ICE] DataChannel closed")
             self._data_channel_open.clear()
 
@@ -319,19 +341,25 @@ class IceManager:
         if self._data_channel_open.is_set():
             return True
         # 如果 DataChannel 存在且 readyState=open，直接设置
-        if self._data_channel and hasattr(self._data_channel, 'readyState'):
-            if self._data_channel.readyState == "open":
-                self._data_channel_open.set()
-                return True
+        if (
+            self._data_channel
+            and hasattr(self._data_channel, "readyState")
+            and self._data_channel.readyState == "open"
+        ):
+            self._data_channel_open.set()
+            return True
         try:
             await asyncio.wait_for(self._data_channel_open.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             # 最后再检查一次 readyState
-            if self._data_channel and hasattr(self._data_channel, 'readyState'):
-                if self._data_channel.readyState == "open":
-                    self._data_channel_open.set()
-                    return True
+            if (
+                self._data_channel
+                and hasattr(self._data_channel, "readyState")
+                and self._data_channel.readyState == "open"
+            ):
+                self._data_channel_open.set()
+                return True
             logger.warning("[ICE] DataChannel open timeout")
             return False
 
@@ -339,11 +367,11 @@ class IceManager:
         """尝试提取选中的候选地址（用于直接 UDP 传输）"""
         if not self._pc:
             return
-        
+
         try:
             # 从 aiortc 内部获取选中的候选对
             transports = getattr(self._pc, "_transports", {})
-            for name, transport in transports.items():
+            for transport in transports.values():
                 ice_transport = getattr(transport, "iceTransport", None)
                 if ice_transport:
                     # 获取选中的候选对
@@ -351,31 +379,31 @@ class IceManager:
                     if selected_pair:
                         local = selected_pair.localCandidate
                         remote = selected_pair.remoteCandidate
-                        
+
                         self.selected_local_candidate = LocalIceCandidate(
                             candidate=f"{local.protocol} {local.ip}:{local.port}",
                         )
                         self.selected_remote_candidate = LocalIceCandidate(
                             candidate=f"{remote.protocol} {remote.ip}:{remote.port}",
                         )
-                        
+
                         self.selected_address = (remote.ip, remote.port)
                         logger.info(
                             f"[ICE] Selected pair: {local.ip}:{local.port} "
                             f"-> {remote.ip}:{remote.port} (via {local.type})"
                         )
-                        
+
                         if self.on_remote_address and self.selected_address:
                             self.on_remote_address(self.selected_address)
                         break
         except Exception as e:
             logger.debug(f"[ICE] Could not extract selected candidates: {e}")
 
-    async def wait_for_connection(self, timeout: Optional[float] = None) -> bool:
+    async def wait_for_connection(self, timeout: float | None = None) -> bool:
         """等待 ICE 连接成功"""
         if timeout is None:
             timeout = self.config.connectivity_check_timeout
-        
+
         try:
             await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
             return True
@@ -383,37 +411,28 @@ class IceManager:
             logger.warning("[ICE] Connection timeout")
             return False
 
-    def get_relay_candidates(self) -> List[LocalIceCandidate]:
+    def get_relay_candidates(self) -> list[LocalIceCandidate]:
         """获取 TURN 中继候选地址"""
-        return [
-            c for c in self.local_candidates
-            if "typ relay" in c.candidate.lower()
-        ]
+        return [c for c in self.local_candidates if "typ relay" in c.candidate.lower()]
 
-    def get_server_reflexive_candidates(self) -> List[LocalIceCandidate]:
+    def get_server_reflexive_candidates(self) -> list[LocalIceCandidate]:
         """获取 STUN 服务器反射候选"""
-        return [
-            c for c in self.local_candidates
-            if "typ srflx" in c.candidate.lower()
-        ]
+        return [c for c in self.local_candidates if "typ srflx" in c.candidate.lower()]
 
-    def get_host_candidates(self) -> List[LocalIceCandidate]:
+    def get_host_candidates(self) -> list[LocalIceCandidate]:
         """获取主机候选地址"""
-        return [
-            c for c in self.local_candidates
-            if "typ host" in c.candidate.lower()
-        ]
+        return [c for c in self.local_candidates if "typ host" in c.candidate.lower()]
 
     async def close(self) -> None:
         """关闭 ICE 管理器"""
         logger.info("[ICE] Closing ICE manager")
         self._set_state(ConnectionState.CLOSED)
-        
+
         if self._pc:
             try:
                 await self._pc.close()
             except Exception as e:
                 logger.debug(f"[ICE] Error closing peer connection: {e}")
             self._pc = None
-        
+
         logger.info("[ICE] ICE manager closed")

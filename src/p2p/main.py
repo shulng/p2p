@@ -1,11 +1,13 @@
 """P2P 主程序入口 - 子命令 CLI"""
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-import signal
+import pickle
 import sys
-from typing import Optional
+from dataclasses import dataclass
+
 from loguru import logger
 
 from .config import (
@@ -13,10 +15,9 @@ from .config import (
     IceConfig,
     P2PConfig,
 )
-from .game_tunnel import GameTunnel, TunnelConfig
 from .node import P2PNode
-from .types import ConnectionState, Message, MessageType
-
+from .tunnel.game_tunnel import GameTunnel, TunnelConfig
+from .types import Message, MessageType
 
 DEFAULT_SIGNALING = "ws://localhost:8765"
 
@@ -26,7 +27,10 @@ def _setup_logger(level: str = "INFO") -> None:
     logger.add(
         sys.stderr,
         level=level,
-        format="<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+        format=(
+            "<green>{time:HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | <cyan>{message}</cyan>"
+        ),
     )
 
 
@@ -41,6 +45,7 @@ def _base_config(role: ConnectionRole, signaling: str) -> P2PConfig:
 
 # ============== chat ==============
 
+
 async def _run_chat(signaling: str, room: str, as_side: str) -> int:
     role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
     cfg = _base_config(role, signaling)
@@ -52,15 +57,14 @@ async def _run_chat(signaling: str, room: str, as_side: str) -> int:
 
     recv_seq = 0
 
-    def on_message(msg: Message):
+    def on_message(msg: Message) -> None:
         nonlocal recv_seq
         recv_seq += 1
         if msg.msg_type == MessageType.DATA_TEXT:
             logger.info(f"[recv #{recv_seq}] {msg.sender_id}: {msg.payload}")
         else:
-            logger.info(
-                f"[recv {msg.msg_type.value} #{recv_seq}] len={len(msg.payload) if isinstance(msg.payload, bytes) else 0}B"
-            )
+            size = len(msg.payload) if isinstance(msg.payload, bytes) else 0
+            logger.info(f"[recv {msg.msg_type.value} #{recv_seq}] len={size}B")
 
     node = P2PNode(
         config=cfg,
@@ -109,7 +113,10 @@ async def _run_chat(signaling: str, room: str, as_side: str) -> int:
 
 # ============== bench ==============
 
-async def _run_bench(signaling: str, room: str, as_side: str, duration: float) -> int:
+
+async def _run_bench(  # pylint: disable=too-many-locals
+    signaling: str, room: str, as_side: str, duration: float
+) -> int:
     role = ConnectionRole.INITIATOR if as_side == "a" else ConnectionRole.RESPONDER
     cfg = _base_config(role, signaling)
     logger.info(f"=== bench as side {as_side} ({role.value}), transport=KCP ===")
@@ -118,22 +125,21 @@ async def _run_bench(signaling: str, room: str, as_side: str, duration: float) -
     total_bytes = 0
     msg_count = 0
 
-    def on_message(msg: Message):
+    def on_message(msg: Message) -> None:
         nonlocal total_bytes, msg_count, start_time
         if start_time is None:
             start_time = asyncio.get_event_loop().time()
         if isinstance(msg.payload, bytes):
             total_bytes += len(msg.payload)
         else:
-            import pickle
             total_bytes += len(pickle.dumps(msg.payload))
         msg_count += 1
         elapsed = asyncio.get_event_loop().time() - start_time
         if elapsed > 0 and msg_count % 100 == 0:
             logger.info(
                 f"[BENCH] {msg_count} msgs, "
-                f"{total_bytes/1024/1024:.2f} MB, "
-                f"{total_bytes/elapsed/1024/1024:.2f} MB/s"
+                f"{total_bytes / 1024 / 1024:.2f} MB, "
+                f"{total_bytes / elapsed / 1024 / 1024:.2f} MB/s"
             )
 
     node = P2PNode(config=cfg, on_message=on_message)
@@ -161,8 +167,8 @@ async def _run_bench(signaling: str, room: str, as_side: str, duration: float) -
         total_sent = sent_count * len(chunk)
         logger.success(
             f"[BENCH SENT] {sent_count} msgs, "
-            f"{total_sent/1024/1024:.2f} MB in {elapsed:.1f}s, "
-            f"{total_sent/elapsed/1024/1024:.2f} MB/s"
+            f"{total_sent / 1024 / 1024:.2f} MB in {elapsed:.1f}s, "
+            f"{total_sent / elapsed / 1024 / 1024:.2f} MB/s"
         )
         await asyncio.sleep(2.0)
     else:
@@ -179,36 +185,33 @@ async def _run_bench(signaling: str, room: str, as_side: str, duration: float) -
 
 # ============== tunnel (server / client) ==============
 
-async def _run_tunnel(
-    signaling: str,
-    room: str,
-    *,
-    is_server: bool,
-    tcp_port: Optional[int],
-    udp_port: Optional[int],
-    name: str,
-) -> int:
-    # 推断协议
+
+@dataclass
+class _TunnelArgs:
+    """隧道启动参数（收敛 CLI 传入的配置）。"""
+
+    signaling: str
+    room: str
+    is_server: bool
+    tcp_port: int | None
+    udp_port: int | None
+    name: str
+
+
+def _infer_protocol(tcp_port: int | None, udp_port: int | None) -> str:
+    """根据端口参数推断隧道协议"""
     if tcp_port and udp_port:
-        protocol = "both"
-    elif udp_port and not tcp_port:
-        protocol = "udp"
-    else:
-        protocol = "tcp"
+        return "both"
+    if udp_port and not tcp_port:
+        return "udp"
+    return "tcp"
 
-    role = ConnectionRole.RESPONDER if is_server else ConnectionRole.INITIATOR
+
+def _print_tunnel_mapping(
+    is_server: bool, protocol: str, tcp_port: int | None, udp_port: int | None
+) -> None:
+    """打印隧道端口映射信息"""
     role_label = "SERVER" if is_server else "CLIENT"
-
-    tunnel_cfg = TunnelConfig(
-        protocol=protocol,
-        name=name or role_label,
-        local_listen_port=tcp_port or 0,
-        remote_forward_port=tcp_port or 0,
-        local_listen_port_udp=udp_port,
-        remote_forward_port_udp=udp_port,
-    )
-
-    # 打印实际映射
     logger.info(f"=== tunnel {role_label} ===")
     logger.info(f"protocol = {protocol}")
     if is_server:
@@ -222,6 +225,31 @@ async def _run_tunnel(
         if udp_port:
             logger.info(f"Listen UDP 127.0.0.1:{udp_port} → P2P")
 
+
+async def _run_tunnel(args: _TunnelArgs) -> int:
+    signaling = args.signaling
+    room = args.room
+    is_server = args.is_server
+    tcp_port = args.tcp_port
+    udp_port = args.udp_port
+    name = args.name
+
+    protocol = _infer_protocol(tcp_port, udp_port)
+    role = ConnectionRole.RESPONDER if is_server else ConnectionRole.INITIATOR
+    role_label = "SERVER" if is_server else "CLIENT"
+
+    tunnel_cfg = TunnelConfig(
+        protocol=protocol,
+        name=name or role_label,
+        local_listen_port=tcp_port or 0,
+        remote_forward_port=tcp_port or 0,
+        local_listen_port_udp=udp_port,
+        remote_forward_port_udp=udp_port,
+    )
+
+    # 打印实际映射
+    _print_tunnel_mapping(is_server, protocol, tcp_port, udp_port)
+
     p2p_cfg = P2PConfig(
         role=role,
         ice=IceConfig.with_cloudflare_turn(),
@@ -230,7 +258,7 @@ async def _run_tunnel(
 
     tunnel = GameTunnel(p2p_cfg, tunnel_cfg, role)
 
-    async def print_stats():
+    async def print_stats() -> None:
         while True:
             await asyncio.sleep(30)
             s = tunnel.get_stats()
@@ -254,7 +282,9 @@ async def _run_tunnel(
 
 # ============== CLI ==============
 
+
 def build_parser() -> argparse.ArgumentParser:
+    """构建 CLI 参数解析器。"""
     p = argparse.ArgumentParser(
         prog="p2p",
         description="P2P Tunnel (KCP + SCTP via DataChannel + Cloudflare TURN)",
@@ -296,44 +326,78 @@ Examples:
     # --- chat ---
     sp = sub.add_parser("chat", help="P2P 通信测试 (A 发消息, B 回)")
     sp.add_argument("room", help="房间 ID")
-    sp.add_argument("--as", dest="as_side", choices=["a", "b"], required=True,
-                    help="a=initiator(发测试消息), b=responder(回消息)")
-    sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING,
-                    help=f"信令服务器 (默认: {DEFAULT_SIGNALING})")
+    sp.add_argument(
+        "--as",
+        dest="as_side",
+        choices=["a", "b"],
+        required=True,
+        help="a=initiator(发测试消息), b=responder(回消息)",
+    )
+    sp.add_argument(
+        "-s",
+        "--signaling",
+        default=DEFAULT_SIGNALING,
+        help=f"信令服务器 (默认: {DEFAULT_SIGNALING})",
+    )
 
     # --- bench ---
     sp = sub.add_parser("bench", help="性能测试 (A 发大数据, B 收)")
     sp.add_argument("room", help="房间 ID")
-    sp.add_argument("--as", dest="as_side", choices=["a", "b"], required=True,
-                    help="a=sender, b=receiver")
+    sp.add_argument(
+        "--as",
+        dest="as_side",
+        choices=["a", "b"],
+        required=True,
+        help="a=sender, b=receiver",
+    )
     sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
-    sp.add_argument("--duration", type=float, default=30.0,
-                    help="A 端发送时长（秒，默认 30）")
+    sp.add_argument("--duration", type=float, default=30.0, help="A 端发送时长（秒，默认 30）")
 
     # --- server ---
     sp = sub.add_parser("server", help="SERVER 端：将 P2P 流量转发到本地服务端口")
     sp.add_argument("room", help="房间 ID（与 client 端相同）")
     sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
-    sp.add_argument("--tcp", dest="tcp_port", type=int, default=None,
-                    help="本地目标 TCP 端口（SERVER 侧服务端监听端口）")
-    sp.add_argument("--udp", dest="udp_port", type=int, default=None,
-                    help="本地目标 UDP 端口（SERVER 侧服务端监听端口）")
+    sp.add_argument(
+        "--tcp",
+        dest="tcp_port",
+        type=int,
+        default=None,
+        help="本地目标 TCP 端口（SERVER 侧服务端监听端口）",
+    )
+    sp.add_argument(
+        "--udp",
+        dest="udp_port",
+        type=int,
+        default=None,
+        help="本地目标 UDP 端口（SERVER 侧服务端监听端口）",
+    )
     sp.add_argument("--name", default="", help="日志显示名")
 
     # --- client ---
     sp = sub.add_parser("client", help="CLIENT 端：起本地监听，通过 P2P 连到 SERVER 端服务")
     sp.add_argument("room", help="房间 ID（与 server 端相同）")
     sp.add_argument("-s", "--signaling", default=DEFAULT_SIGNALING)
-    sp.add_argument("--tcp", dest="tcp_port", type=int, default=None,
-                    help="本地监听 TCP 端口（用户客户端连这个）")
-    sp.add_argument("--udp", dest="udp_port", type=int, default=None,
-                    help="本地监听 UDP 端口（用户客户端连这个）")
+    sp.add_argument(
+        "--tcp",
+        dest="tcp_port",
+        type=int,
+        default=None,
+        help="本地监听 TCP 端口（用户客户端连这个）",
+    )
+    sp.add_argument(
+        "--udp",
+        dest="udp_port",
+        type=int,
+        default=None,
+        help="本地监听 UDP 端口（用户客户端连这个）",
+    )
     sp.add_argument("--name", default="", help="日志显示名")
 
     return p
 
 
 def main() -> None:
+    """CLI 入口：解析参数、配置日志并运行隧道。"""
     parser = build_parser()
     args = parser.parse_args()
 
@@ -343,9 +407,7 @@ def main() -> None:
         if args.cmd == "chat":
             rc = asyncio.run(_run_chat(args.signaling, args.room, args.as_side))
         elif args.cmd == "bench":
-            rc = asyncio.run(
-                _run_bench(args.signaling, args.room, args.as_side, args.duration)
-            )
+            rc = asyncio.run(_run_bench(args.signaling, args.room, args.as_side, args.duration))
         elif args.cmd == "server":
             if not (args.tcp_port or args.udp_port):
                 logger.error("server 需要至少一个: --tcp PORT 或 --udp PORT")
@@ -353,11 +415,14 @@ def main() -> None:
             else:
                 rc = asyncio.run(
                     _run_tunnel(
-                        args.signaling, args.room,
-                        is_server=True,
-                        tcp_port=args.tcp_port,
-                        udp_port=args.udp_port,
-                        name=args.name,
+                        _TunnelArgs(
+                            signaling=args.signaling,
+                            room=args.room,
+                            is_server=True,
+                            tcp_port=args.tcp_port,
+                            udp_port=args.udp_port,
+                            name=args.name,
+                        )
                     )
                 )
         elif args.cmd == "client":
@@ -367,11 +432,14 @@ def main() -> None:
             else:
                 rc = asyncio.run(
                     _run_tunnel(
-                        args.signaling, args.room,
-                        is_server=False,
-                        tcp_port=args.tcp_port,
-                        udp_port=args.udp_port,
-                        name=args.name,
+                        _TunnelArgs(
+                            signaling=args.signaling,
+                            room=args.room,
+                            is_server=False,
+                            tcp_port=args.tcp_port,
+                            udp_port=args.udp_port,
+                            name=args.name,
+                        )
                     )
                 )
         else:
@@ -389,4 +457,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

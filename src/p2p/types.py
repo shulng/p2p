@@ -1,11 +1,12 @@
 """P2P 类型定义模块"""
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
-from enum import Enum
-from datetime import datetime
-import uuid
 
-from .config import TransportProtocol, ConnectionRole
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+from .config import ConnectionRole, TransportProtocol
 
 
 def generate_peer_id() -> str:
@@ -15,6 +16,7 @@ def generate_peer_id() -> str:
 
 class MessageType(str, Enum):
     """消息类型"""
+
     # 信令消息
     SIGNAL_OFFER = "signal.offer"
     SIGNAL_ANSWER = "signal.answer"
@@ -24,13 +26,13 @@ class MessageType(str, Enum):
     SIGNAL_PING = "signal.ping"
     SIGNAL_PONG = "signal.pong"
     SIGNAL_ROOM_INFO = "signal.room_info"
-    
+
     # P2P 数据消息
     DATA_TEXT = "data.text"
     DATA_BINARY = "data.binary"
     DATA_JSON = "data.json"
     DATA_FILE = "data.file"
-    
+
     # 控制消息
     CTRL_HEARTBEAT = "ctrl.heartbeat"
     CTRL_ACK = "ctrl.ack"
@@ -40,6 +42,7 @@ class MessageType(str, Enum):
 
 class ConnectionState(str, Enum):
     """连接状态"""
+
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -53,18 +56,20 @@ class ConnectionState(str, Enum):
 @dataclass
 class PeerInfo:
     """Peer 信息"""
+
     peer_id: str
     role: ConnectionRole
-    address: Optional[str] = None
-    port: Optional[int] = None
-    transport: Optional[TransportProtocol] = None
-    connected_at: Optional[datetime] = None
-    user_data: Dict[str, Any] = field(default_factory=dict)
+    address: str | None = None
+    port: int | None = None
+    transport: TransportProtocol | None = None
+    connected_at: datetime | None = None
+    user_data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Message:
     """P2P 消息"""
+
     msg_id: str
     msg_type: MessageType
     sender_id: str
@@ -72,7 +77,7 @@ class Message:
     payload: Any = None
     timestamp: datetime = field(default_factory=datetime.now)
     seq: int = 0
-    
+
     @classmethod
     def create(
         cls,
@@ -81,6 +86,7 @@ class Message:
         receiver_id: str,
         payload: Any = None,
     ) -> "Message":
+        """工厂方法：生成一条带随机 msg_id 的消息。"""
         return cls(
             msg_id=uuid.uuid4().hex,
             msg_type=msg_type,
@@ -93,14 +99,16 @@ class Message:
 @dataclass
 class IceCandidate:
     """ICE 候选地址"""
+
     candidate: str
-    sdp_mid: Optional[str] = None
-    sdp_mline_index: Optional[int] = None
+    sdp_mid: str | None = None
+    sdp_mline_index: int | None = None
 
 
 @dataclass
 class SessionDescription:
     """会话描述 (SDP)"""
+
     sdp_type: str  # offer / answer
     sdp: str
 
@@ -108,6 +116,7 @@ class SessionDescription:
 @dataclass
 class TransportStats:
     """传输层统计"""
+
     bytes_sent: int = 0
     bytes_received: int = 0
     packets_sent: int = 0
@@ -121,19 +130,21 @@ class TransportStats:
 @dataclass
 class ConnectionStats:
     """连接统计"""
+
     peer_id: str
     state: ConnectionState
     transport: TransportProtocol
-    ice_state: Optional[str] = None
-    local_address: Optional[str] = None
-    remote_address: Optional[str] = None
-    kcp_stats: Optional[TransportStats] = None
-    connected_since: Optional[datetime] = None
+    ice_state: str | None = None
+    local_address: str | None = None
+    remote_address: str | None = None
+    kcp_stats: TransportStats | None = None
+    connected_since: datetime | None = None
 
 
 @dataclass
 class RoomInfo:
     """房间信息"""
+
     room_id: str
-    peers: List[PeerInfo] = field(default_factory=list)
+    peers: list[PeerInfo] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)

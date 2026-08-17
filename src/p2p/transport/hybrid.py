@@ -11,22 +11,26 @@
   4. INITIATOR 用收到的地址发起 KCP 直连
   5. 数据发送走 KCP,直连不可用则降级到 SCTP
 """
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import socket
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
 from loguru import logger
 
-from .config import KcpConfig, ConnectionRole
-from .kcp_transport import KCPTransport
-
+from ..config import ConnectionRole, KcpConfig
+from .kcp import KCPTransport
 
 # 通道类型
-CHANNEL_CONTROL = "control"    # 控制信令 → SCTP
-CHANNEL_DATA = "data"          # 数据 → KCP
+CHANNEL_CONTROL = "control"  # 控制信令 → SCTP
+CHANNEL_DATA = "data"  # 数据 → KCP
 
 # SCTP 上的 KCP 传输管理消息类型(通过 DataChannel 发送)
 KCP_MSG_ADDR = "kcp.addr"  # 交换 KCP 监听地址
@@ -35,6 +39,7 @@ KCP_MSG_ADDR = "kcp.addr"  # 交换 KCP 监听地址
 @dataclass
 class KcpTransportStats:
     """KCP 传输统计"""
+
     sctp_bytes_sent: int = 0
     sctp_bytes_recv: int = 0
     kcp_bytes_sent: int = 0
@@ -56,30 +61,30 @@ class KCPDataTransport:
     def __init__(
         self,
         role: ConnectionRole,
-        kcp_config: Optional[KcpConfig] = None,
+        kcp_config: KcpConfig | None = None,
     ):
         self.role = role
         self.kcp_config = kcp_config or KcpConfig()
 
         # 传输实例
-        self._kcp: Optional[KCPTransport] = None
+        self._kcp: KCPTransport | None = None
 
         # 通道就绪状态
         self._kcp_ready = False
         self._sctp_ready = False
 
         # SCTP 发送回调 (由 P2PNode 注入: bytes -> bool)
-        self._sctp_send: Optional[Callable[[bytes], bool]] = None
+        self._sctp_send: Callable[[bytes], bool] | None = None
 
         # 数据接收回调: (data: bytes, channel: str) -> None
-        self.on_data: Optional[Callable[[bytes, str], None]] = None
+        self.on_data: Callable[[bytes, str], None] | None = None
 
         # 对端的 KCP 地址 + conv(RESPONDER 分配,INITIATOR 复用)
-        self._remote_kcp_addr: Optional[Tuple[str, int]] = None
-        self._remote_kcp_conv: Optional[int] = None
+        self._remote_kcp_addr: tuple[str, int] | None = None
+        self._remote_kcp_conv: int | None = None
 
         # 本地 KCP 监听地址
-        self._local_kcp_addr: Optional[Tuple[str, int]] = None
+        self._local_kcp_addr: tuple[str, int] | None = None
 
         # 统计
         self.stats = KcpTransportStats()
@@ -91,16 +96,18 @@ class KCPDataTransport:
 
     @property
     def kcp_ready(self) -> bool:
+        """KCP 直连通道是否就绪。"""
         return self._kcp_ready
 
     @property
     def sctp_ready(self) -> bool:
+        """SCTP (DataChannel) 通道是否就绪。"""
         return self._sctp_ready
 
     @property
-    def active_channels(self) -> list:
+    def active_channels(self) -> list[str]:
         """当前可用的通道列表"""
-        channels = []
+        channels: list[str] = []
         if self._sctp_ready:
             channels.append(CHANNEL_CONTROL)
         if self._kcp_ready:
@@ -157,7 +164,7 @@ class KCPDataTransport:
     # ========== 地址交换 ==========
 
     @staticmethod
-    def _reachable_addr(addr: Optional[Tuple[str, int]]) -> Optional[Tuple[str, int]]:
+    def _reachable_addr(addr: tuple[str, int] | None) -> tuple[str, int] | None:
         """将 0.0.0.0/空 绑定地址转换为对端可达的真实 IP
 
         KCP 直连是快速路径(同机/LAN 可达,跨 NAT 失败则降级 SCTP)。
@@ -169,9 +176,8 @@ class KCPDataTransport:
         if host and host != "0.0.0.0" and host != "::":
             return addr
         # 探测本机出口 IP(不真正发包,仅让 OS 选路填充源地址)
-        import socket as _sock
         try:
-            s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             real_ip = s.getsockname()[0]
             s.close()
@@ -202,16 +208,14 @@ class KCPDataTransport:
         if self._sctp_send(payload):
             logger.info(f"[KCP] Sent addr: kcp={kcp_adv}, conv={kcp_conv}")
 
-    def _handle_addr_exchange(self, msg: Dict[str, Any]) -> None:
+    def _handle_addr_exchange(self, msg: dict[str, Any]) -> None:
         """收到对端的 KCP 地址"""
         kcp = msg.get("kcp_addr")
         # KCP conv 由 RESPONDER 分配,INITIATOR 必须复用以匹配会话
         self._remote_kcp_conv = msg.get("kcp_conv")
         if kcp:
             self._remote_kcp_addr = (kcp[0], kcp[1])
-            logger.info(
-                f"[KCP] Remote addr: {self._remote_kcp_addr}, conv={self._remote_kcp_conv}"
-            )
+            logger.info(f"[KCP] Remote addr: {self._remote_kcp_addr}, conv={self._remote_kcp_conv}")
 
         # 地址已收到,立即完成交换等待(直连在后台进行,不阻塞 wait_for_addr_exchange)
         self._addr_exchanged.set()
@@ -275,7 +279,7 @@ class KCPDataTransport:
         if channel == CHANNEL_CONTROL:
             return self._send_sctp(data)
 
-        elif channel == CHANNEL_DATA:
+        if channel == CHANNEL_DATA:
             # 优先 KCP,降级 SCTP
             if self._kcp_ready and self._kcp:
                 ok = await self._kcp.send(data)
@@ -312,6 +316,7 @@ class KCPDataTransport:
             return False
 
     def get_stats(self) -> KcpTransportStats:
+        """返回当前传输统计，并同步通道就绪状态。"""
         self.stats.kcp_ready = self._kcp_ready
         return self.stats
 
@@ -320,10 +325,8 @@ class KCPDataTransport:
         logger.info("[KCP] Closing all channels")
 
         if self._kcp:
-            try:
+            with contextlib.suppress(Exception):
                 await self._kcp.close()
-            except Exception:
-                pass
             self._kcp = None
             self._kcp_ready = False
 

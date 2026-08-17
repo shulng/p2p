@@ -17,7 +17,7 @@ dependencies = [
 
 [project.scripts]
 p2p = "p2p.main:main"
-p2p-signaling = "p2p.signaling_server:main"
+p2p-signaling = "p2p.signaling.server:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

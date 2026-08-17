@@ -3,34 +3,35 @@
 支持多 Peer 同时连接：每个远端 Peer 拥有独立的 IceManager / RTCPeerConnection，
 通过 peer_id 路由信令、ICE 候选与数据。数据统一通过 KCP 传输。
 """
+
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
-import time
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, Any
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 from loguru import logger
 
 from .config import (
+    ConnectionRole,
     P2PConfig,
     TransportProtocol,
-    ConnectionRole,
 )
+from .ice.ice_manager import IceManager
+from .signaling.client import SignalingClient, SignalingEvents
+from .transport.hybrid import CHANNEL_DATA, KCPDataTransport
 from .types import (
     ConnectionState,
+    IceCandidate,
     Message,
     MessageType,
     PeerInfo,
     SessionDescription,
-    IceCandidate,
-    ConnectionStats,
     generate_peer_id,
 )
-from .ice_manager import IceManager
-from .signaling_client import SignalingClient, SignalingEvents
-from .hybrid_transport import KCPDataTransport, CHANNEL_DATA
 
 
 class P2PNode:
@@ -39,16 +40,16 @@ class P2PNode:
     def __init__(
         self,
         config: P2PConfig,
-        on_message: Optional[Callable[[Message], None]] = None,
-        on_peer_connected: Optional[Callable[[PeerInfo], None]] = None,
-        on_peer_disconnected: Optional[Callable[[str], None]] = None,
-        on_state_changed: Optional[Callable[[str, ConnectionState], None]] = None,
+        on_message: Callable[[Message], Awaitable[None] | None] | None = None,
+        on_peer_connected: Callable[[PeerInfo], None] | None = None,
+        on_peer_disconnected: Callable[[str], None] | None = None,
+        on_state_changed: Callable[[str, ConnectionState], None] | None = None,
     ):
         self.config = config
         self.peer_id: str = generate_peer_id()
         self.config.signaling.peer_id = self.peer_id
         # KCP 传输 (数据统一走 KCP, 控制走 SCTP)
-        self._kcp_transports: Dict[str, KCPDataTransport] = {}
+        self._kcp_transports: dict[str, KCPDataTransport] = {}
 
         # 回调
         self.on_message = on_message
@@ -61,21 +62,21 @@ class P2PNode:
         self.state: ConnectionState = ConnectionState.DISCONNECTED
 
         # 模块
-        self._signaling: Optional[SignalingClient] = None
+        self._signaling: SignalingClient | None = None
         # 多 Peer：每个 peer_id 拥有独立的 IceManager / RTCPeerConnection
-        self._ice_managers: Dict[str, IceManager] = {}
+        self._ice_managers: dict[str, IceManager] = {}
         # 多 Peer 消息有序处理：per-peer 队列 + worker，保证同一 peer 的消息按到达顺序处理
         # （TCP 流转发强依赖字节顺序，create_task 并发会导致数据乱序）
-        self._peer_msg_queues: Dict[str, "asyncio.Queue[Optional[Message]]"] = {}
-        self._peer_msg_workers: Dict[str, asyncio.Task] = {}
+        self._peer_msg_queues: dict[str, asyncio.Queue[Message | None]] = {}
+        self._peer_msg_workers: dict[str, asyncio.Task[Any]] = {}
 
         # 连接的 Peer: peer_id -> {transport, state, ...}
-        self._peers: Dict[str, Dict[str, Any]] = {}
+        self._peers: dict[str, dict[str, Any]] = {}
 
         # 每 peer 的协商锁，避免不同 peer 互相阻塞
-        self._negotiation_locks: Dict[str, asyncio.Lock] = {}
+        self._negotiation_locks: dict[str, asyncio.Lock] = {}
         # 每 peer 的 answer 等待事件: peer_id -> asyncio.Event
-        self._wait_answer_events: Dict[str, asyncio.Event] = {}
+        self._wait_answer_events: dict[str, asyncio.Event] = {}
 
     def _set_state(self, state: ConnectionState) -> None:
         if self.state != state:
@@ -105,19 +106,21 @@ class P2PNode:
         ice = IceManager(
             config=self.config.ice,
             # 用默认参数绑定 peer_id，避免闭包延迟绑定问题
-            on_ice_candidate=lambda cand, pid=peer_id: self._on_ice_candidate(pid, cand),
-            on_connection_state=lambda state, pid=peer_id: self._on_ice_state(pid, state),
-            on_ice_gathering_done=lambda pid=peer_id: self._on_ice_gathering_done(pid),
-            on_remote_address=lambda addr, pid=peer_id: self._on_ice_remote_addr(pid, addr),
+            on_ice_candidate=lambda cand: self._on_ice_candidate(peer_id, cand),
+            on_connection_state=lambda state: self._on_ice_state(peer_id, state),
+            on_ice_gathering_done=lambda: self._on_ice_gathering_done(peer_id),
+            on_remote_address=lambda addr: self._on_ice_remote_addr(peer_id, addr),
         )
-        ice.on_data_received = lambda data, pid=peer_id: self._on_ice_data(pid, data)
+        ice.on_data_received = lambda data: self._on_ice_data(peer_id, data)
         self._ice_managers[peer_id] = ice
         logger.info(f"[P2PNode] Created IceManager for peer {peer_id}")
         return ice
 
     async def initialize(self) -> None:
         """初始化节点"""
-        logger.info(f"[P2PNode] Initializing {self.peer_id}, transport={self.config.transport.value}")
+        logger.info(
+            f"[P2PNode] Initializing {self.peer_id}, transport={self.config.transport.value}"
+        )
 
         # 初始化信令（IceManager 按需在 connect_to_peer / _signal_on_offer 中创建）
         events = SignalingEvents(
@@ -145,11 +148,14 @@ class P2PNode:
     async def join_room(
         self,
         room_id: str,
-        role: Optional[ConnectionRole] = None,
+        role: ConnectionRole | None = None,
     ) -> bool:
         """加入房间"""
         if role:
             self.config.role = role
+        if not self._signaling:
+            logger.error("[P2PNode] Not initialized")
+            return False
         return await self._signaling.join_room(room_id, self.config.role)
 
     async def connect_to_peer(self, target_peer_id: str) -> bool:
@@ -193,17 +199,17 @@ class P2PNode:
             logger.info(f"[P2PNode] Waiting for ICE connection with {target_peer_id}...")
             ice_ok = await ice.wait_for_connection(timeout=30.0)
 
-            if ice_ok:
-                logger.info(f"[P2PNode] ICE connection established with {target_peer_id}")
-                ok = await self._establish_transports(target_peer_id)
-                if not ok:
-                    await self._fail_peer_connection(target_peer_id, "transport establishment failed")
-                    return False
-                return True
-            else:
+            if not ice_ok:
                 logger.warning(f"[P2PNode] ICE connection failed with {target_peer_id}")
                 await self._fail_peer_connection(target_peer_id, "ICE failed")
                 return False
+
+            logger.info(f"[P2PNode] ICE connection established with {target_peer_id}")
+            ok = await self._establish_transports(target_peer_id)
+            if not ok:
+                await self._fail_peer_connection(target_peer_id, "transport establishment failed")
+                return False
+            return True
 
     async def _signal_on_offer(self, from_peer_id: str, offer: SessionDescription) -> None:
         """收到 Offer (作为响应方，为该 from_peer_id 创建独立 IceManager)"""
@@ -223,7 +229,8 @@ class P2PNode:
             answer = await ice.create_answer(offer)
 
             # 发送 Answer
-            await self._signaling.send_answer(from_peer_id, answer)
+            if self._signaling:
+                await self._signaling.send_answer(from_peer_id, answer)
 
             logger.info(f"[P2PNode] Answer sent to {from_peer_id}")
 
@@ -264,9 +271,7 @@ class P2PNode:
     def _on_ice_candidate(self, peer_id: str, candidate: IceCandidate) -> None:
         """本地产生 ICE 候选 - 通过信令发送给指定 peer"""
         if self._signaling:
-            asyncio.create_task(
-                self._signaling.send_ice_candidate(peer_id, candidate)
-            )
+            asyncio.create_task(self._signaling.send_ice_candidate(peer_id, candidate))
 
     def _on_ice_state(self, peer_id: str, state: ConnectionState) -> None:
         """某 peer 的 ICE 状态变化
@@ -279,7 +284,11 @@ class P2PNode:
         logger.info(f"[P2PNode] ICE state for {peer_id}: {state}, ice_state={ice_state}")
 
         # 连接断开/失败时清理
-        if state in (ConnectionState.DISCONNECTED, ConnectionState.FAILED, ConnectionState.CLOSED):
+        if state in (
+            ConnectionState.DISCONNECTED,
+            ConnectionState.FAILED,
+            ConnectionState.CLOSED,
+        ):
             # _cleanup_peer 是 async，但本回调是 sync；用 create_task 调度
             asyncio.create_task(self._cleanup_and_notify(peer_id))
 
@@ -307,7 +316,7 @@ class P2PNode:
             for i, c in enumerate(relay_candidates):
                 logger.info(f"  [{i}] {c.candidate[:100]}")
 
-    def _on_ice_remote_addr(self, peer_id: str, addr: Tuple[str, int]) -> None:
+    def _on_ice_remote_addr(self, peer_id: str, addr: tuple[str, int]) -> None:
         """某 peer 的 ICE 远端地址"""
         logger.info(f"[P2PNode] ICE remote address for {peer_id}: {addr}")
 
@@ -372,11 +381,13 @@ class P2PNode:
             kcp_config=self.config.kcp,
         )
         # 注入 SCTP 发送回调（必须同步:DataChannel.send 本身同步,且保证 TCP 字节序）
-        kcp_transport.on_sctp_ready(lambda data: ice.send_data_sync(data))
+        kcp_transport.on_sctp_ready(ice.send_data_sync)
+
         # 设置数据接收回调:所有通道(CTRL/DATA)收到的都是序列化 Message,
         # 统一交给 _handle_transport_data 解码并路由到 on_message(per-peer 有序队列)
-        def _on_kcp_data(data: bytes, channel: str) -> None:
+        def _on_kcp_data(data: bytes, _channel: str) -> None:
             self._handle_transport_data(data, self.config.transport, peer_id)
+
         kcp_transport.on_data = _on_kcp_data
 
         self._kcp_transports[peer_id] = kcp_transport
@@ -391,7 +402,7 @@ class P2PNode:
         # 等待地址交换完成(INITIATOR 会自动发起直连)
         await kcp_transport.wait_for_addr_exchange(timeout=10.0)
 
-    def _get_kcp_transport(self, peer_id: str) -> Optional[KCPDataTransport]:
+    def _get_kcp_transport(self, peer_id: str) -> KCPDataTransport | None:
         """获取指定 peer 的 KCP 传输实例"""
         return self._kcp_transports.get(peer_id)
 
@@ -456,10 +467,13 @@ class P2PNode:
         logger.info(f"[P2PNode] Peer left: {peer_id}")
         await self._cleanup_and_notify(peer_id)
 
-    async def _cleanup_peer(self, peer_id: str) -> None:
+    async def _cleanup_peer(self, peer_id: str) -> bool:
         """清理指定 peer 的所有资源（IceManager / 锁 / 事件 / peer 状态 / 消息队列）
 
         幂等：重复调用安全。用于连接失败、ICE 断开、peer 离开等所有清理路径。
+
+        Returns:
+            该 peer 在被清理前是否处于已连接状态。
         """
         was_connected = self._peers.pop(peer_id, None) is not None
         self._wait_answer_events.pop(peer_id, None)
@@ -484,10 +498,8 @@ class P2PNode:
         worker = self._peer_msg_workers.pop(peer_id, None)
         if worker is not None:
             worker.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker
-            except asyncio.CancelledError:
-                pass
         return was_connected
 
     async def _fail_peer_connection(self, peer_id: str, reason: str) -> None:
@@ -495,12 +507,9 @@ class P2PNode:
         logger.warning(f"[P2PNode] Failing connection with {peer_id}: {reason}")
         await self._cleanup_peer(peer_id)
 
-    def _signal_on_room_info(self, peers: List[PeerInfo]) -> None:
+    def _signal_on_room_info(self, peers: list[PeerInfo]) -> None:
         """房间信息更新"""
-        logger.info(
-            f"[P2PNode] Room has {len(peers)} peers: "
-            f"{[p.peer_id for p in peers]}"
-        )
+        logger.info(f"[P2PNode] Room has {len(peers)} peers: {[p.peer_id for p in peers]}")
 
     def _signal_on_connected(self) -> None:
         """信令连接成功"""
@@ -524,14 +533,14 @@ class P2PNode:
         self,
         data: bytes,
         transport: TransportProtocol,
-        peer_id: Optional[str] = None,
+        peer_id: str | None = None,
     ) -> None:
         """处理从传输层收到的数据
 
         关键：同一 peer 的消息必须按到达顺序处理（TCP 字节流强依赖顺序）。
         通过 per-peer 队列 + 单 worker 串行 await，避免 create_task 并发导致乱序。
         """
-        msg: Optional[Message] = None
+        msg: Message | None = None
         try:
             msg = self._decode_message(data)
             logger.debug(
@@ -557,19 +566,17 @@ class P2PNode:
         queue = self._get_or_create_msg_queue(peer_id)
         queue.put_nowait(msg)
 
-    def _get_or_create_msg_queue(self, peer_id: str) -> "asyncio.Queue[Optional[Message]]":
+    def _get_or_create_msg_queue(self, peer_id: str) -> asyncio.Queue[Message | None]:
         """获取或创建 per-peer 消息队列 + worker"""
         if peer_id not in self._peer_msg_queues:
             # 无上限队列：不主动丢消息，内存增长由对端发送速率决定
-            queue: "asyncio.Queue[Optional[Message]]" = asyncio.Queue()
+            queue: asyncio.Queue[Message | None] = asyncio.Queue()
             self._peer_msg_queues[peer_id] = queue
-            self._peer_msg_workers[peer_id] = asyncio.create_task(
-                self._msg_worker(peer_id, queue)
-            )
+            self._peer_msg_workers[peer_id] = asyncio.create_task(self._msg_worker(peer_id, queue))
             logger.debug(f"[P2PNode] Created message queue+worker for {peer_id}")
         return self._peer_msg_queues[peer_id]
 
-    async def _msg_worker(self, peer_id: str, queue: "asyncio.Queue[Optional[Message]]") -> None:
+    async def _msg_worker(self, peer_id: str, queue: asyncio.Queue[Message | None]) -> None:
         """per-peer 消息处理 worker：按队列顺序 await 处理，保证消息不乱序"""
         while True:
             msg = await queue.get()
@@ -648,9 +655,17 @@ class P2PNode:
         peer_id: str,
         msg_type: MessageType,
         payload: Any = None,
-        prefer_transport: Optional[TransportProtocol] = None,
+        _prefer_transport: TransportProtocol | None = None,
     ) -> bool:
-        """发送消息到指定 Peer (通过该 peer 的 ICE DataChannel)"""
+        """发送消息到指定 Peer (通过该 peer 的 ICE DataChannel)
+
+        Args:
+            peer_id: 目标 peer 标识。
+            msg_type: 消息类型。
+            payload: 消息负载。
+            _prefer_transport: 预留的传输偏好参数（当前固定走 ICE
+                DataChannel，保留以维持 API 契约）。
+        """
         if peer_id not in self._peers:
             logger.warning(f"[P2PNode] Unknown peer: {peer_id}")
             return False
@@ -683,12 +698,13 @@ class P2PNode:
         """发送二进制数据"""
         return await self.send_to_peer(peer_id, MessageType.DATA_BINARY, data)
 
-    def get_connected_peers(self) -> List[str]:
+    def get_connected_peers(self) -> list[str]:
         """获取已连接的 Peer ID 列表"""
-        return [pid for pid, data in self._peers.items()
-                if data["state"] == ConnectionState.CONNECTED]
+        return [
+            pid for pid, data in self._peers.items() if data["state"] == ConnectionState.CONNECTED
+        ]
 
-    def get_connection_stats(self, peer_id: Optional[str] = None) -> Dict[str, Any]:
+    def get_connection_stats(self, peer_id: str | None = None) -> dict[str, Any]:
         """获取连接统计"""
         if peer_id:
             if peer_id not in self._peers:

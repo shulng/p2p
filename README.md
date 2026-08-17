@@ -278,8 +278,8 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from p2p import P2PConfig, ConnectionRole, IceConfig
-from p2p.game_tunnel import GameTunnel, TunnelConfig
+from p2p import P2PConfig, ConnectionRole, GameTunnel, IceConfig
+from p2p.tunnel.game_tunnel import TunnelConfig
 
 async def main():
     # 通用配置：协议、端口、目标都由参数指定
@@ -311,48 +311,50 @@ asyncio.run(main())
 ```
 p2p/
 ├── src/p2p/
-│   ├── __init__.py          # 库导出
+│   ├── __init__.py          # 库导出(公共 API)
 │   ├── config.py            # 配置类(P2PConfig / IceConfig / KcpConfig ...)
 │   ├── types.py             # 数据类型(Message / PeerInfo / ConnectionState ...)
-│   ├── kcp.py               # KCP 协议纯 Python 实现
-│   ├── kcp_transport.py     # KCP 异步传输层封装
-│   ├── hybrid_transport.py  # 传输管理器(数据走 KCP,控制走 SCTP)
-│   ├── ice_manager.py       # ICE / STUN / TURN 管理(基于 aiortc)
-│   ├── signaling_server.py  # WebSocket 信令服务器
-│   ├── signaling_client.py  # 信令客户端(自动重连)
-│   ├── node.py              # P2P 节点(整合所有模块)
-│   ├── game_tunnel.py       # 通用隧道(TCP/UDP 流量转发)
-│   └── main.py              # CLI 入口
+│   ├── _compat.py           # websockets 版本兼容层
+│   ├── _utils.py            # 公共工具函数(cancel_task 等)
+│   ├── node.py              # P2P 节点(整合各层,门面)
+│   ├── main.py              # CLI 入口
+│   ├── transport/           # 传输层
+│   │   ├── kcp_core.py      # KCP 协议纯 Python 实现
+│   │   ├── kcp.py           # KCP 异步传输层封装
+│   │   └── hybrid.py        # 传输管理器(数据走 KCP,控制走 SCTP)
+│   ├── signaling/           # 信令层
+│   │   ├── client.py        # 信令客户端(自动重连)
+│   │   └── server.py        # WebSocket 信令服务器
+│   ├── ice/                 # NAT 穿透层
+│   │   └── ice_manager.py   # ICE / STUN / TURN 管理(基于 aiortc)
+│   └── tunnel/              # 应用层
+│       └── game_tunnel.py   # 通用隧道(TCP/UDP 流量转发)
 ├── pyproject.toml
 └── README.md
 ```
 
 ## 模块说明
 
-### config.py
-
-定义所有配置类。核心 `P2PConfig` 包含传输、ICE、信令等子配置。`IceConfig.with_cloudflare_turn()` 返回内置 Cloudflare TURN 服务器配置（含 STUN 与 TURN，UDP + TCP）。
-
-### kcp.py
+### transport/kcp_core.py（原 kcp.py）
 
 纯 Python 实现的 KCP 协议,使用 fast 模式:`nodelay=1, interval=10ms, resend=2, nc=1`(无拥塞控制,低延迟)。支持分片、可靠有序传输、丢包重传、拥塞窗口与窗口探测。
 
-### kcp_transport.py
+### transport/kcp.py（原 kcp_transport.py）
 
 KCP 的异步 UDP 传输层封装：绑定端口、收发循环、KCP update 循环、连接握手。
 
-### hybrid_transport.py
+### transport/hybrid.py（原 hybrid_transport.py）
 
 传输管理器，协调 SCTP (DataChannel) 与 KCP：
 - **control** 通道走 SCTP，始终可用（含 TURN 中继场景）
 - **data** 通道优先 KCP 直连，失败自动降级 SCTP
 - RESPONDER 绑定 KCP 端口并通过 SCTP 交换地址，INITIATOR 据此发起 KCP 直连
 
-### ice_manager.py
+### ice/ice_manager.py
 
 基于 aiortc 管理 ICE 协商、DataChannel 收发。使用 Cloudflare TURN 服务器(`turn.cloudflare.com:3478`)作为中继兜底。ICE 候选收集顺序:Host(内网)→ SRFLX(STUN 反射)→ Relay(TURN 中继)。
 
-### signaling_client.py / signaling_server.py
+### signaling/client.py / signaling/server.py
 
 WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持自动重连(指数退避),异步回调通过 `asyncio.create_task()` 调度。
 
@@ -364,7 +366,7 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 > 注意：`send_to_peer` / `send_text` / `send_bytes` 走 SCTP(DataChannel)；`send_to_peer_channel(channel=CHANNEL_DATA)` 走 KCP 优先、SCTP 降级。
 
-### game_tunnel.py
+### tunnel/game_tunnel.py
 
 `GameTunnel` 在 P2P 连接上转发 **TCP / UDP** 流量。CLIENT 端在本地起监听(TCP 用 `asyncio.start_server`,UDP 用 `create_datagram_endpoint`),HOST 端连接本地目标服务,双向转发数据。
 
@@ -377,7 +379,7 @@ WebSocket 信令,用于交换 SDP Offer/Answer 和 ICE 候选。客户端支持�
 
 ### 传输协议
 
-数据通过 `hybrid_transport.KCPDataTransport` 管理：
+数据通过 `transport.hybrid.KCPDataTransport` 管理：
 - **control** 信令走 SCTP (DataChannel)
 - **data** 数据优先走 **KCP**(纯 Python 实现,fast 模式低延迟,适合实时游戏),KCP 直连不可用(如严格 NAT 下 KCP 无法直连)时自动降级到 SCTP
 

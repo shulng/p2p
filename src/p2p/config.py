@@ -1,16 +1,18 @@
 """P2P 配置模块"""
+
 from dataclasses import dataclass, field
-from typing import List, Optional
 from enum import Enum
 
 
 class TransportProtocol(str, Enum):
     """传输协议类型"""
+
     KCP = "kcp"
 
 
 class ConnectionRole(str, Enum):
     """连接角色"""
+
     INITIATOR = "initiator"
     RESPONDER = "responder"
 
@@ -18,6 +20,7 @@ class ConnectionRole(str, Enum):
 @dataclass
 class TurnServerConfig:
     """TURN 服务器配置"""
+
     url: str = "turn:turn.cloudflare.com:3478"
     username: str = ""
     credential: str = ""
@@ -28,6 +31,7 @@ class TurnServerConfig:
 @dataclass
 class KcpConfig:
     """KCP 传输配置"""
+
     enabled: bool = True
     host: str = "0.0.0.0"
     port: int = 0
@@ -46,7 +50,8 @@ class KcpConfig:
 @dataclass
 class IceConfig:
     """ICE 配置"""
-    ice_servers: List[TurnServerConfig] = field(default_factory=list)
+
+    ice_servers: list[TurnServerConfig] = field(default_factory=list)
     ice_transport_policy: str = "all"  # all / relay
     gather_timeout: float = 10.0
     connectivity_check_timeout: float = 15.0
@@ -56,21 +61,15 @@ class IceConfig:
         """使用 Cloudflare TURN 服务器创建配置"""
         return cls(
             ice_servers=[
-                TurnServerConfig(
-                    url="stun:stun.cloudflare.com:3478",
-                    use_cloudflare=True
-                ),
-                TurnServerConfig(
-                    url="stun:stun.cloudflare.com:3478",
-                    use_cloudflare=True
-                ),
+                TurnServerConfig(url="stun:stun.cloudflare.com:3478", use_cloudflare=True),
+                TurnServerConfig(url="stun:stun.cloudflare.com:3478", use_cloudflare=True),
                 TurnServerConfig(
                     url="turn:turn.cloudflare.com:3478?transport=udp",
-                    use_cloudflare=True
+                    use_cloudflare=True,
                 ),
                 TurnServerConfig(
                     url="turn:turn.cloudflare.com:3478?transport=tcp",
-                    use_cloudflare=True
+                    use_cloudflare=True,
                 ),
             ]
         )
@@ -79,16 +78,18 @@ class IceConfig:
 @dataclass
 class SignalingConfig:
     """信令服务器配置"""
+
     server_url: str = "ws://localhost:8765"
     reconnect_interval: float = 2.0
     max_reconnect_attempts: int = 10
-    room_id: Optional[str] = None
-    peer_id: Optional[str] = None
+    room_id: str | None = None
+    peer_id: str | None = None
 
 
 @dataclass
 class P2PConfig:
     """P2P 主配置"""
+
     transport: TransportProtocol = TransportProtocol.KCP
     role: ConnectionRole = ConnectionRole.INITIATOR
     kcp: KcpConfig = field(default_factory=KcpConfig)

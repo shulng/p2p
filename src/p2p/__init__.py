@@ -10,77 +10,69 @@
 __version__ = "0.1.0"
 
 from .config import (
-    P2PConfig,
+    ConnectionRole,
     IceConfig,
     KcpConfig,
-    TurnServerConfig,
+    P2PConfig,
     SignalingConfig,
     TransportProtocol,
-    ConnectionRole,
+    TurnServerConfig,
 )
-from .types import (
-    ConnectionState,
-    MessageType,
-    Message,
-    PeerInfo,
-    SessionDescription,
-    IceCandidate,
-    TransportStats,
-    ConnectionStats,
-    RoomInfo,
-    generate_peer_id,
-)
-from .kcp import KCP
-from .kcp_transport import KCPTransport
-from .ice_manager import IceManager
-from .signaling_client import SignalingClient, SignalingEvents
-from .signaling_server import SignalingServer
+from .ice.ice_manager import IceManager
 from .node import P2PNode
-from .game_tunnel import GameTunnel, TunnelConfig
-from .hybrid_transport import (
-    KCPDataTransport,
-    KcpTransportStats,
+from .signaling.client import SignalingClient, SignalingEvents
+from .signaling.server import SignalingServer
+from .transport.hybrid import (
     CHANNEL_CONTROL,
     CHANNEL_DATA,
+    KCPDataTransport,
+    KcpTransportStats,
+)
+from .transport.kcp import KCPTransport
+from .transport.kcp_core import KCP
+from .tunnel.game_tunnel import GameTunnel, TunnelConfig
+from .types import (
+    ConnectionState,
+    ConnectionStats,
+    IceCandidate,
+    Message,
+    MessageType,
+    PeerInfo,
+    RoomInfo,
+    SessionDescription,
+    TransportStats,
+    generate_peer_id,
 )
 
 __all__ = [
-    # Config
-    "P2PConfig",
-    "IceConfig",
-    "KcpConfig",
-    "TurnServerConfig",
-    "SignalingConfig",
-    "TransportProtocol",
-    "ConnectionRole",
-    # Types
-    "ConnectionState",
-    "MessageType",
-    "Message",
-    "PeerInfo",
-    "SessionDescription",
-    "IceCandidate",
-    "TransportStats",
-    "ConnectionStats",
-    "RoomInfo",
-    "generate_peer_id",
-    # KCP
-    "KCP",
-    "KCPTransport",
-    # ICE
-    "IceManager",
-    # Signaling
-    "SignalingClient",
-    "SignalingEvents",
-    "SignalingServer",
-    # Node
-    "P2PNode",
-    # Game Tunnel
-    "GameTunnel",
-    "TunnelConfig",
-    # KCP Transport Manager
-    "KCPDataTransport",
-    "KcpTransportStats",
     "CHANNEL_CONTROL",
     "CHANNEL_DATA",
+    "KCP",
+    "ConnectionRole",
+    "ConnectionState",
+    "ConnectionStats",
+    "GameTunnel",
+    "IceCandidate",
+    "IceConfig",
+    "IceManager",
+    "KCPDataTransport",
+    "KCPTransport",
+    "KcpConfig",
+    "KcpTransportStats",
+    "Message",
+    "MessageType",
+    "P2PConfig",
+    "P2PNode",
+    "PeerInfo",
+    "RoomInfo",
+    "SessionDescription",
+    "SignalingClient",
+    "SignalingConfig",
+    "SignalingEvents",
+    "SignalingServer",
+    "TransportProtocol",
+    "TransportStats",
+    "TunnelConfig",
+    "TurnServerConfig",
+    "generate_peer_id",
 ]

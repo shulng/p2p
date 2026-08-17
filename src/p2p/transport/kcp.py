@@ -1,17 +1,21 @@
 """KCP 异步传输层"""
+
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
-import struct
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple, Any
+from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Any
+
 from loguru import logger
 
-from .config import KcpConfig
-from .types import ConnectionState, TransportStats, generate_peer_id
-from .kcp import KCP
+from .._utils import cancel_task
+from ..config import KcpConfig
+from ..types import ConnectionState, TransportStats, generate_peer_id
+from .kcp_core import KCP
 
 
 class KCPTransport:
@@ -20,49 +24,52 @@ class KCPTransport:
     def __init__(
         self,
         config: KcpConfig,
-        conv_id: Optional[int] = None,
-        on_data_received: Optional[Callable[[bytes], None]] = None,
-        on_connection_state: Optional[Callable[[ConnectionState], None]] = None,
+        conv_id: int | None = None,
+        on_data_received: Callable[[bytes], None] | None = None,
+        on_connection_state: Callable[[ConnectionState], None] | None = None,
     ):
         self.config = config
-        self.conv_id: int = conv_id if conv_id is not None else int(time.time() * 1000) & 0x7fffffff
+        self.conv_id: int = conv_id if conv_id is not None else int(time.time() * 1000) & 0x7FFFFFFF
         self.on_data_received = on_data_received
         self.on_connection_state = on_connection_state
-        
+
         # 传输状态
         self.state: ConnectionState = ConnectionState.DISCONNECTED
         self.stats: TransportStats = TransportStats()
-        
+
         # UDP 套接字
-        self._sock: Optional[socket.socket] = None
-        self._local_addr: Optional[Tuple[str, int]] = None
-        self._remote_addr: Optional[Tuple[str, int]] = None
-        
+        self._sock: socket.socket | None = None
+        self._local_addr: tuple[str, int] | None = None
+        self._remote_addr: tuple[str, int] | None = None
+
         # KCP 实例
-        self._kcp: Optional[KCP] = None
-        
+        self._kcp: KCP | None = None
+
         # 异步任务
-        self._recv_task: Optional[asyncio.Task] = None
-        self._update_task: Optional[asyncio.Task] = None
+        self._recv_task: asyncio.Task[Any] | None = None
+        self._update_task: asyncio.Task[Any] | None = None
         self._running: bool = False
-        
+
         # 发送队列
-        self._send_queue: asyncio.Queue = asyncio.Queue()
-        
+        self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
         # 回调
         self._connected_event: asyncio.Event = asyncio.Event()
         self._peer_id: str = generate_peer_id()
 
     @property
     def peer_id(self) -> str:
+        """当前 peer 的唯一标识。"""
         return self._peer_id
 
     @property
-    def local_address(self) -> Optional[Tuple[str, int]]:
+    def local_address(self) -> tuple[str, int] | None:
+        """本地绑定的地址，未绑定前为 None。"""
         return self._local_addr
 
     @property
-    def remote_address(self) -> Optional[Tuple[str, int]]:
+    def remote_address(self) -> tuple[str, int] | None:
+        """对端地址，未建立连接前为 None。"""
         return self._remote_addr
 
     def _set_state(self, state: ConnectionState) -> None:
@@ -74,7 +81,7 @@ class KCPTransport:
             if self.on_connection_state:
                 self.on_connection_state(state)
 
-    def _kcp_output(self, data: bytes, kcp: KCP, user: Any) -> int:
+    def _kcp_output(self, data: bytes, _kcp: KCP, _user: Any) -> int:
         """KCP 输出回调 - 将 KCP 段通过 UDP 发送"""
         try:
             if self._sock and self._remote_addr:
@@ -98,7 +105,7 @@ class KCPTransport:
         self._kcp.wndsize(self.config.sndwnd, self.config.rcvwnd)
         self._kcp.setmtu(self.config.mtu)
 
-    async def bind(self, host: str = "", port: int = 0) -> Tuple[str, int]:
+    async def bind(self, host: str = "", port: int = 0) -> tuple[str, int]:
         """
         绑定本地 UDP 端口
         :return: (host, port)
@@ -114,35 +121,36 @@ class KCPTransport:
 
         self._local_addr = self._sock.getsockname()
         logger.info(f"[KCP] Bound to {self._local_addr}")
+        assert self._local_addr is not None
         return self._local_addr
 
-    def set_remote(self, address: Tuple[str, int]) -> None:
+    def set_remote(self, address: tuple[str, int]) -> None:
         """
         设置远端地址
         """
         self._remote_addr = address
         logger.info(f"[KCP] Remote address set to {address}")
 
-    async def connect(self, remote_addr: Tuple[str, int]) -> bool:
+    async def connect(self, remote_addr: tuple[str, int]) -> bool:
         """
         连接到远端
         """
         try:
             self._set_state(ConnectionState.CONNECTING)
-            
+
             if not self._local_addr:
                 await self.bind(self.config.host, self.config.port)
-            
+
             self.set_remote(remote_addr)
             self._init_kcp()
-            
+
             self._running = True
             self._recv_task = asyncio.create_task(self._recv_loop())
             self._update_task = asyncio.create_task(self._update_loop())
-            
+
             # 发送握手包
             await self._send_handshake()
-            
+
             # 等待连接确认
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=10.0)
@@ -155,7 +163,7 @@ class KCPTransport:
                 # 失败必须清理 recv/update 循环，否则持续向无效地址发包刷错误
                 await self.close()
                 return False
-                
+
         except Exception as e:
             logger.error(f"[KCP] Connect error: {e}")
             self._set_state(ConnectionState.FAILED)
@@ -169,25 +177,25 @@ class KCPTransport:
             self._kcp.send(handshake_data)
             self._kcp.flush()
 
-    async def accept_connection(self, remote_addr: Optional[Tuple[str, int]] = None) -> bool:
+    async def accept_connection(self, remote_addr: tuple[str, int] | None = None) -> bool:
         """
         作为服务端接受连接
         """
         try:
             self._set_state(ConnectionState.CONNECTING)
-            
+
             if not self._local_addr:
                 await self.bind(self.config.host, self.config.port)
-            
+
             if remote_addr:
                 self.set_remote(remote_addr)
-            
+
             self._init_kcp()
-            
+
             self._running = True
             self._recv_task = asyncio.create_task(self._recv_loop())
             self._update_task = asyncio.create_task(self._update_loop())
-            
+
             # 等待握手数据
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=15.0)
@@ -199,7 +207,7 @@ class KCPTransport:
                 self._set_state(ConnectionState.FAILED)
                 await self.close()
                 return False
-                
+
         except Exception as e:
             logger.error(f"[KCP] Accept error: {e}")
             self._set_state(ConnectionState.FAILED)
@@ -209,32 +217,36 @@ class KCPTransport:
         """接收循环"""
         loop = asyncio.get_running_loop()
         logger.info("[KCP] Recv loop started")
-        
+
         try:
-            while self._running:
+            while self._running and self._sock:
                 try:
                     # 异步接收数据
-                    data, addr = await loop.sock_recvfrom(self._sock, 65535)
-                    
+                    # sock_recvfrom 是 SelectorEventLoop 专有方法，
+                    # 不在 AbstractEventLoop stub 中，故加 type ignore。
+                    data, addr = await loop.sock_recvfrom(  # type: ignore[attr-defined]
+                        self._sock, 65535
+                    )
+
                     if data and len(data) >= 4:
                         # 如果没有设置远端地址，从第一个包获取
                         if not self._remote_addr:
                             self.set_remote(addr)
                             self._connected_event.set()
-                        
+
                         self.stats.bytes_received += len(data)
                         self.stats.packets_received += 1
-                        
+
                         # 输入到 KCP
                         if self._kcp:
                             self._kcp.input(data)
-                            
+
                             # 尝试从 KCP 接收数据
                             while True:
                                 recv_data = self._kcp.recv(65535)
                                 if not recv_data:
                                     break
-                                
+
                                 # 处理握手
                                 if recv_data == b"KCP_HANDSHAKE":
                                     logger.debug("[KCP] Received handshake")
@@ -250,7 +262,7 @@ class KCPTransport:
                                 else:
                                     if self.on_data_received:
                                         self.on_data_received(recv_data)
-                                    
+
                 except BlockingIOError:
                     await asyncio.sleep(0.001)
                 except asyncio.CancelledError:
@@ -274,7 +286,7 @@ class KCPTransport:
                             self._kcp.send(data)
                         except asyncio.QueueEmpty:
                             break
-                    
+
                     # 更新 KCP
                     next_update = self._kcp.update()
                     wait_time = min(next_update / 1000.0, 0.05)
@@ -295,7 +307,7 @@ class KCPTransport:
         if self.state != ConnectionState.CONNECTED:
             logger.warning(f"[KCP] Cannot send, state: {self.state}")
             return False
-        
+
         try:
             await self._send_queue.put(data)
             return True
@@ -318,33 +330,19 @@ class KCPTransport:
         logger.info("[KCP] Closing transport")
         self._running = False
         self._set_state(ConnectionState.CLOSED)
-        
-        if self._recv_task and not self._recv_task.done():
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self._update_task and not self._update_task.done():
-            self._update_task.cancel()
-            try:
-                await self._update_task
-            except asyncio.CancelledError:
-                pass
-        
+
+        await cancel_task(self._recv_task)
+        await cancel_task(self._update_task)
+
         if self._sock:
-            try:
+            with contextlib.suppress(Exception):
                 self._sock.close()
-            except Exception:
-                pass
             self._sock = None
-        
+
         self._kcp = None
         logger.info("[KCP] Transport closed")
 
     def get_stats(self) -> TransportStats:
         """获取传输统计"""
-        from datetime import datetime
-        self.stats.last_updated = datetime.now()
+        self.stats.last_updated = datetime.now(timezone.utc)
         return self.stats
