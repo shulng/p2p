@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from dataclasses import dataclass
 
 from loguru import logger
@@ -127,7 +128,7 @@ async def _run_bench(  # pylint: disable=too-many-locals
     def on_message(msg: Message) -> None:
         nonlocal total_bytes, msg_count, start_time
         if start_time is None:
-            start_time = asyncio.get_event_loop().time()
+            start_time = time.monotonic()
         # 与发送端编码方式保持一致：bytes 统计原始长度，
         # 非 bytes 按实际大小估算（bench 场景为 bytes，此处为防御）。
         if isinstance(msg.payload, bytes):
@@ -135,7 +136,7 @@ async def _run_bench(  # pylint: disable=too-many-locals
         else:
             total_bytes += len(str(msg.payload).encode("utf-8"))
         msg_count += 1
-        elapsed = asyncio.get_event_loop().time() - start_time
+        elapsed = time.monotonic() - start_time
         if elapsed > 0 and msg_count % 100 == 0:
             logger.info(
                 f"[BENCH] {msg_count} msgs, "
@@ -156,15 +157,15 @@ async def _run_bench(  # pylint: disable=too-many-locals
 
     if as_side == "a":
         chunk = b"X" * (64 * 1024)
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.monotonic()
         sent_count = 0
         try:
-            while asyncio.get_event_loop().time() - start_time < duration:
+            while time.monotonic() - start_time < duration:
                 await node.send_bytes(peer_id, chunk)
                 sent_count += 1
         except KeyboardInterrupt:
             pass
-        elapsed = asyncio.get_event_loop().time() - start_time
+        elapsed = time.monotonic() - start_time
         total_sent = sent_count * len(chunk)
         logger.success(
             f"[BENCH SENT] {sent_count} msgs, "

@@ -390,7 +390,7 @@ class GameTunnel:
 
     async def _start_local_udp_server(self) -> None:
         """CLIENT 端：启动本地 UDP 监听"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
             lambda: _UdpClientProtocol(on_datagram=self._on_local_udp_datagram),
             local_addr=(self.tunnel_config.local_listen_host, self._local_udp_port()),
@@ -433,7 +433,7 @@ class GameTunnel:
             if relay is None or relay.transport is None:
                 # 创建新的 UDP relay 连接到本地目标
                 try:
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     _, protocol = await loop.create_datagram_endpoint(
                         lambda: _UdpRelayProtocol(
                             conn_id=conn_id,
