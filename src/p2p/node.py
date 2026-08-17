@@ -270,8 +270,18 @@ class P2PNode:
 
     def _on_ice_candidate(self, peer_id: str, candidate: IceCandidate) -> None:
         """本地产生 ICE 候选 - 通过信令发送给指定 peer"""
-        if self._signaling:
-            asyncio.create_task(self._signaling.send_ice_candidate(peer_id, candidate))
+        if not self._signaling:
+            return
+        task = asyncio.create_task(self._signaling.send_ice_candidate(peer_id, candidate))
+
+        def _log_candidate_error(t: asyncio.Task[Any]) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning(f"[P2PNode] Failed to send ICE candidate to {peer_id}: {exc}")
+
+        task.add_done_callback(_log_candidate_error)
 
     def _on_ice_state(self, peer_id: str, state: ConnectionState) -> None:
         """某 peer 的 ICE 状态变化
@@ -290,7 +300,17 @@ class P2PNode:
             ConnectionState.CLOSED,
         ):
             # _cleanup_peer 是 async，但本回调是 sync；用 create_task 调度
-            asyncio.create_task(self._cleanup_and_notify(peer_id))
+            # 并捕获清理过程中的异常，避免任务异常被 asyncio 静默丢弃。
+            cleanup_task = asyncio.create_task(self._cleanup_and_notify(peer_id))
+
+            def _log_cleanup_error(task: asyncio.Task[Any]) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    logger.error(f"[P2PNode] Cleanup error for {peer_id}: {exc}")
+
+            cleanup_task.add_done_callback(_log_cleanup_error)
 
     async def _cleanup_and_notify(self, peer_id: str) -> None:
         """ICE 断开后的清理 + 通知（幂等：仅在 was_connected 时通知一次）"""
@@ -460,7 +480,16 @@ class P2PNode:
             and peer.peer_id not in self._peers
         ):
             logger.info(f"[P2PNode] Auto-connecting to responder {peer.peer_id}")
-            asyncio.create_task(self.connect_to_peer(peer.peer_id))
+            connect_task = asyncio.create_task(self.connect_to_peer(peer.peer_id))
+
+            def _log_connect_error(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    logger.error(f"[P2PNode] Auto-connect to {peer.peer_id} failed: {exc}")
+
+            connect_task.add_done_callback(_log_connect_error)
 
     async def _signal_on_peer_left(self, peer_id: str) -> None:
         """Peer 离开房间（幂等：复用 _cleanup_and_notify，与 ICE 断开路径一致）"""

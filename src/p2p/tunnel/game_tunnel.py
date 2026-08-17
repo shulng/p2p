@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -25,7 +24,7 @@ from loguru import logger
 from ..config import ConnectionRole, P2PConfig
 from ..node import P2PNode
 from ..transport.hybrid import CHANNEL_CONTROL, CHANNEL_DATA
-from ..types import Message, MessageType, PeerInfo
+from ..types import Message, MessageType, PeerInfo, generate_id
 
 # 隧道消息类型（复用 Message 结构，payload 为 dict）
 TUNNEL_TCP_OPEN = "tunnel.tcp.open"  # 打开 TCP 隧道
@@ -278,7 +277,7 @@ class GameTunnel:
         writer: asyncio.StreamWriter,
     ) -> None:
         """处理本地 TCP 客户端连接"""
-        conn_id = uuid.uuid4().hex[:12]
+        conn_id = generate_id("conn")
         peer_addr = writer.get_extra_info("peername")
         logger.info(f"[Tunnel-TCP] Local connection #{conn_id} from {peer_addr}")
 
@@ -404,7 +403,7 @@ class GameTunnel:
         """CLIENT 端：收到本地 UDP 客户端数据包"""
         conn_id = self._udp_client_to_conn.get(addr)
         if conn_id is None:
-            conn_id = uuid.uuid4().hex[:12]
+            conn_id = generate_id("conn")
             self._udp_client_to_conn[addr] = conn_id
             self._udp_conn_to_client[conn_id] = addr
             self._connections_count += 1

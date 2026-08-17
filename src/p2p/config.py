@@ -1,5 +1,7 @@
 """P2P 配置模块"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -61,7 +63,6 @@ class IceConfig:
         """使用 Cloudflare TURN 服务器创建配置"""
         return cls(
             ice_servers=[
-                TurnServerConfig(url="stun:stun.cloudflare.com:3478", use_cloudflare=True),
                 TurnServerConfig(url="stun:stun.cloudflare.com:3478", use_cloudflare=True),
                 TurnServerConfig(
                     url="turn:turn.cloudflare.com:3478?transport=udp",

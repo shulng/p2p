@@ -41,6 +41,7 @@ from .types import (
     RoomInfo,
     SessionDescription,
     TransportStats,
+    generate_id,
     generate_peer_id,
 )
 
@@ -74,5 +75,6 @@ __all__ = [
     "TransportStats",
     "TunnelConfig",
     "TurnServerConfig",
+    "generate_id",
     "generate_peer_id",
 ]

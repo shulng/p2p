@@ -237,12 +237,15 @@ class SignalingServer:
         if room_id:
             await self._broadcast_room_info(room_id)
 
-    async def _broadcast_room_info(self, room_id: str) -> None:
-        """广播房间信息给所有成员"""
-        if room_id not in self._rooms:
-            return
+    def _build_room_peers(self, room_id: str) -> list[dict[str, Any]]:
+        """构建房间内的 peer 列表（供 room_info 消息使用）。
 
-        peers = []
+        集中处理 peer 字段组装，避免 ``_broadcast_room_info`` 与
+        ``_send_room_info`` 各自维护重复逻辑（DRY）。
+        """
+        if room_id not in self._rooms:
+            return []
+        peers: list[dict[str, Any]] = []
         for peer_id in self._rooms[room_id]:
             if peer_id in self._clients:
                 c = self._clients[peer_id]
@@ -252,6 +255,14 @@ class SignalingServer:
                         "role": c.role.value if c.role else None,
                     }
                 )
+        return peers
+
+    async def _broadcast_room_info(self, room_id: str) -> None:
+        """广播房间信息给所有成员"""
+        if room_id not in self._rooms:
+            return
+
+        peers = self._build_room_peers(room_id)
 
         room_info = {
             "type": MessageType.SIGNAL_ROOM_INFO.value,
@@ -269,16 +280,7 @@ class SignalingServer:
         if room_id not in self._rooms:
             return
 
-        peers = []
-        for peer_id in self._rooms[room_id]:
-            if peer_id in self._clients:
-                c = self._clients[peer_id]
-                peers.append(
-                    {
-                        "peer_id": peer_id,
-                        "role": c.role.value if c.role else None,
-                    }
-                )
+        peers = self._build_room_peers(room_id)
 
         await client.ws.send(
             json.dumps(

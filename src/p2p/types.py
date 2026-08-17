@@ -1,5 +1,7 @@
 """P2P 类型定义模块"""
 
+from __future__ import annotations
+
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,9 +11,21 @@ from typing import Any
 from .config import ConnectionRole, TransportProtocol
 
 
+def generate_id(prefix: str = "") -> str:
+    """生成一个唯一 ID（默认 12 位十六进制）。
+
+    统一收敛项目中各类 ID 的生成规则（peer_id / msg_id / 隧道 conn_id 等），
+    避免各模块散落 ``uuid.uuid4().hex`` 导致改规则时遗漏。
+
+    Args:
+        prefix: ID 前缀（如 ``"peer"`` / ``"conn"``）。
+    """
+    return f"{prefix}-{uuid.uuid4().hex[:12]}" if prefix else uuid.uuid4().hex[:12]
+
+
 def generate_peer_id() -> str:
     """生成唯一的 Peer ID"""
-    return f"peer-{uuid.uuid4().hex[:12]}"
+    return generate_id("peer")
 
 
 class MessageType(str, Enum):
@@ -88,7 +102,7 @@ class Message:
     ) -> "Message":
         """工厂方法：生成一条带随机 msg_id 的消息。"""
         return cls(
-            msg_id=uuid.uuid4().hex,
+            msg_id=generate_id(),
             msg_type=msg_type,
             sender_id=sender_id,
             receiver_id=receiver_id,
