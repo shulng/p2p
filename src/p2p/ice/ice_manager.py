@@ -47,6 +47,11 @@ from ..types import (
     IceCandidate as LocalIceCandidate,
 )
 
+from .candidate_extractor import (
+    CandidatePairExtractor,
+    default_pair_extractor,
+)
+
 
 class IceManager:
     """ICE 连接管理器 - 处理 STUN/TURN 候选地址收集和连接"""
@@ -58,6 +63,7 @@ class IceManager:
         on_connection_state: Callable[[ConnectionState], None] | None = None,
         on_ice_gathering_done: Callable[[], None] | None = None,
         on_remote_address: Callable[[tuple[str, int]], None] | None = None,
+        pair_extractor: CandidatePairExtractor | None = None,
     ):
         self.config = config
         self.on_ice_candidate = on_ice_candidate
@@ -65,6 +71,11 @@ class IceManager:
         self.on_ice_gathering_done = on_ice_gathering_done
         self.on_remote_address = on_remote_address
         self.on_data_received: Callable[[bytes], None] | None = None
+        # 候选对提取器：注入可替换实现，默认使用 aiortc 私有实现；
+        # 也可注入 NullPairExtractor 以显式禁用 KCP 直连。
+        self._pair_extractor: CandidatePairExtractor = (
+            pair_extractor or default_pair_extractor()
+        )
 
         # 状态
         self.state: ConnectionState = ConnectionState.DISCONNECTED
@@ -364,40 +375,35 @@ class IceManager:
             return False
 
     async def _extract_selected_candidates(self) -> None:
-        """尝试提取选中的候选地址（用于直接 UDP 传输）"""
+        """提取被选中的 ICE 候选对（用于 KCP 直连）。
+
+        委托给注入的 ``CandidatePairExtractor``，实现与底层 WebRTC 库
+        （aiortc）的私有 API 解耦：本方法不接触任何内部属性，读取逻辑
+        全部收敛到提取器实现中。
+        """
         if not self._pc:
             return
 
-        try:
-            # 从 aiortc 内部获取选中的候选对
-            transports = getattr(self._pc, "_transports", {})
-            for transport in transports.values():
-                ice_transport = getattr(transport, "iceTransport", None)
-                if ice_transport:
-                    # 获取选中的候选对
-                    selected_pair = getattr(ice_transport, "_selected_pair", None)
-                    if selected_pair:
-                        local = selected_pair.localCandidate
-                        remote = selected_pair.remoteCandidate
+        pair = await self._pair_extractor.extract(self._pc)
+        if pair is None:
+            return
 
-                        self.selected_local_candidate = LocalIceCandidate(
-                            candidate=f"{local.protocol} {local.ip}:{local.port}",
-                        )
-                        self.selected_remote_candidate = LocalIceCandidate(
-                            candidate=f"{remote.protocol} {remote.ip}:{remote.port}",
-                        )
+        remote = pair.remote
+        local = pair.local
+        self.selected_local_candidate = LocalIceCandidate(
+            candidate=f"{local.protocol} {local.ip}:{local.port}",
+        )
+        self.selected_remote_candidate = LocalIceCandidate(
+            candidate=f"{remote.protocol} {remote.ip}:{remote.port}",
+        )
+        self.selected_address = (remote.ip, remote.port)
 
-                        self.selected_address = (remote.ip, remote.port)
-                        logger.info(
-                            f"[ICE] Selected pair: {local.ip}:{local.port} "
-                            f"-> {remote.ip}:{remote.port} (via {local.type})"
-                        )
-
-                        if self.on_remote_address and self.selected_address:
-                            self.on_remote_address(self.selected_address)
-                        break
-        except Exception as e:
-            logger.debug(f"[ICE] Could not extract selected candidates: {e}")
+        logger.info(
+            f"[ICE] Selected pair: {local.ip}:{local.port} "
+            f"-> {remote.ip}:{remote.port} (via {local.type})"
+        )
+        if self.on_remote_address and self.selected_address:
+            self.on_remote_address(self.selected_address)
 
     async def wait_for_connection(self, timeout: float | None = None) -> bool:
         """等待 ICE 连接成功"""

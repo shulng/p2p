@@ -23,8 +23,7 @@ from loguru import logger
 
 from ..config import ConnectionRole, P2PConfig
 from ..node import P2PNode
-from ..transport.hybrid import CHANNEL_CONTROL, CHANNEL_DATA
-from ..types import Message, MessageType, PeerInfo, generate_id
+from ..types import Message, PeerInfo, generate_id
 
 # 隧道消息类型（复用 Message 结构，payload 为 dict）
 TUNNEL_TCP_OPEN = "tunnel.tcp.open"  # 打开 TCP 隧道
@@ -530,9 +529,10 @@ class GameTunnel:
     async def _send_tunnel_message(self, tunnel_type: str, conn_id: str, data: bytes) -> None:
         """通过 P2P 发送隧道消息（按 conn_id 路由到对应 peer）
 
-        通道策略:
-          - 控制消息 (open/close) → CHANNEL_CONTROL (SCTP/DataChannel)
-          - 数据消息 (DATA)       → CHANNEL_DATA (KCP 优先, 降级 SCTP)
+        通道策略由传输层决定：
+          - 控制消息 (open/close) → control 通道 (SCTP/DataChannel)
+          - 数据消息 (DATA)       → data 通道 (KCP 优先, 降级 SCTP)
+        应用层只表达「控制/数据」语义，不直接感知通道常量。
         """
         if not self._node:
             return
@@ -541,22 +541,19 @@ class GameTunnel:
         if not peer_id:
             return
 
-        # 按消息类型选择通道
+        payload = {
+            "tunnel_type": tunnel_type,
+            "conn_id": conn_id,
+            "data": data,
+        }
         if tunnel_type in (TUNNEL_TCP_DATA, TUNNEL_UDP_DATA):
-            channel = CHANNEL_DATA  # 数据 → KCP
+            ok = await self._node.send_data(peer_id, payload)
         else:
-            channel = CHANNEL_CONTROL  # 控制信令 → SCTP
-
-        await self._node.send_to_peer_channel(
-            peer_id,
-            MessageType.DATA_JSON,
-            {
-                "tunnel_type": tunnel_type,
-                "conn_id": conn_id,
-                "data": data,
-            },
-            channel=channel,
-        )
+            ok = await self._node.send_control(peer_id, payload)
+        if not ok:
+            logger.warning(
+                f"[Tunnel] failed to send {tunnel_type} for conn {conn_id} to {peer_id}"
+            )
 
     def _on_peer_connected(self, peer_info: PeerInfo) -> None:
         """P2P 对端连接成功（支持多 peer）"""

@@ -1,15 +1,17 @@
-"""P2P 节点 - 整合 ICE、KCP、信令
+"""P2P 节点 - 整合 ICE、KCP、信令（门面 / 协调器）
 
 支持多 Peer 同时连接：每个远端 Peer 拥有独立的 IceManager / RTCPeerConnection，
 通过 peer_id 路由信令、ICE 候选与数据。数据统一通过 KCP 传输。
+
+职责划分（与拆分后的模块协作）：
+- 「协商 / 传输」：ICE 协商、KCP 传输初始化等高度耦合状态的逻辑保留在本门面；
+- 「编解码」：委托给 ``message_codec``（Message <-> bytes）；
+- 「队列」：委托给 ``OrderedMessageRouter``（per-peer 有序分发）。
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import contextlib
-import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -21,8 +23,10 @@ from .config import (
     TransportProtocol,
 )
 from .ice.ice_manager import IceManager
+from .message_codec import decode_message, encode_message
+from .message_router import OrderedMessageRouter
 from .signaling.client import SignalingClient, SignalingEvents
-from .transport.hybrid import CHANNEL_DATA, KCPDataTransport
+from .transport.hybrid import CHANNEL_CONTROL, CHANNEL_DATA, KCPDataTransport
 from .types import (
     ConnectionState,
     IceCandidate,
@@ -65,10 +69,9 @@ class P2PNode:
         self._signaling: SignalingClient | None = None
         # 多 Peer：每个 peer_id 拥有独立的 IceManager / RTCPeerConnection
         self._ice_managers: dict[str, IceManager] = {}
-        # 多 Peer 消息有序处理：per-peer 队列 + worker，保证同一 peer 的消息按到达顺序处理
-        # （TCP 流转发强依赖字节顺序，create_task 并发会导致数据乱序）
-        self._peer_msg_queues: dict[str, asyncio.Queue[Message | None]] = {}
-        self._peer_msg_workers: dict[str, asyncio.Task[Any]] = {}
+        # 多 Peer 消息有序处理：委托给 OrderedMessageRouter（per-peer 队列 + worker，
+        # 保证同一 peer 的消息按到达顺序处理；TCP 流转发强依赖字节顺序）
+        self._msg_router = OrderedMessageRouter(on_message=self.on_message)
 
         # 连接的 Peer: peer_id -> {transport, state, ...}
         self._peers: dict[str, dict[str, Any]] = {}
@@ -468,6 +471,26 @@ class P2PNode:
         data = self._encode_message(msg)
         return await self.send_to_peer_kcp(peer_id, data, channel)
 
+    async def send_control(self, peer_id: str, payload: Any) -> bool:
+        """通过 control 通道发送控制消息（走 SCTP/DataChannel）。
+
+        供应用层表达「这是控制消息」的语义，通道由传输层内部映射为
+        CHANNEL_CONTROL，应用层无需感知具体通道常量。
+        """
+        return await self.send_to_peer_channel(
+            peer_id, MessageType.DATA_JSON, payload, channel=CHANNEL_CONTROL
+        )
+
+    async def send_data(self, peer_id: str, payload: Any) -> bool:
+        """通过 data 通道发送数据消息（KCP 优先，降级 SCTP）。
+
+        供应用层表达「这是数据消息」的语义，通道由传输层内部映射为
+        CHANNEL_DATA，应用层无需感知具体通道常量。
+        """
+        return await self.send_to_peer_channel(
+            peer_id, MessageType.DATA_JSON, payload, channel=CHANNEL_DATA
+        )
+
     async def _signal_on_peer_joined(self, peer: PeerInfo) -> None:
         """有新 Peer 加入房间"""
         logger.info(f"[P2PNode] Peer joined: {peer.peer_id} (role={peer.role})")
@@ -519,15 +542,8 @@ class P2PNode:
                 await kcp_transport.close()
             except Exception as e:
                 logger.debug(f"[P2PNode] Error closing KCPDataTransport for {peer_id}: {e}")
-        # 停止消息 worker：发送 None 停止信号（无上限队列不会满）
-        queue = self._peer_msg_queues.pop(peer_id, None)
-        if queue is not None:
-            queue.put_nowait(None)
-        worker = self._peer_msg_workers.pop(peer_id, None)
-        if worker is not None:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+        # 停止该 peer 的消息 worker 并清理其队列
+        await self._msg_router.stop_peer(peer_id)
         return was_connected
 
     async def _fail_peer_connection(self, peer_id: str, reason: str) -> None:
@@ -566,11 +582,10 @@ class P2PNode:
         """处理从传输层收到的数据
 
         关键：同一 peer 的消息必须按到达顺序处理（TCP 字节流强依赖顺序）。
-        通过 per-peer 队列 + 单 worker 串行 await，避免 create_task 并发导致乱序。
+        解码由 ``message_codec`` 负责，按序分发委托给 ``OrderedMessageRouter``。
         """
-        msg: Message | None = None
         try:
-            msg = self._decode_message(data)
+            msg = decode_message(data)
             logger.debug(
                 f"[P2PNode] Received {msg.msg_type.value} via {transport.value} "
                 f"from {msg.sender_id}"
@@ -584,100 +599,14 @@ class P2PNode:
                 payload=data,
             )
 
-        if self.on_message:
+        if self._msg_router.has_callbacks:
             # 按 sender_id 路由到 per-peer 有序队列
             queue_key = msg.sender_id or (peer_id or "unknown")
-            self._enqueue_message(queue_key, msg)
-
-    def _enqueue_message(self, peer_id: str, msg: Message) -> None:
-        """将消息放入 per-peer 队列（无上限队列，不丢消息）"""
-        queue = self._get_or_create_msg_queue(peer_id)
-        queue.put_nowait(msg)
-
-    def _get_or_create_msg_queue(self, peer_id: str) -> asyncio.Queue[Message | None]:
-        """获取或创建 per-peer 消息队列 + worker"""
-        if peer_id not in self._peer_msg_queues:
-            # 无上限队列：不主动丢消息，内存增长由对端发送速率决定
-            queue: asyncio.Queue[Message | None] = asyncio.Queue()
-            self._peer_msg_queues[peer_id] = queue
-            self._peer_msg_workers[peer_id] = asyncio.create_task(self._msg_worker(peer_id, queue))
-            logger.debug(f"[P2PNode] Created message queue+worker for {peer_id}")
-        return self._peer_msg_queues[peer_id]
-
-    async def _msg_worker(self, peer_id: str, queue: asyncio.Queue[Message | None]) -> None:
-        """per-peer 消息处理 worker：按队列顺序 await 处理，保证消息不乱序"""
-        while True:
-            msg = await queue.get()
-            if msg is None:  # 停止信号
-                queue.task_done()
-                break
-            try:
-                if self.on_message:
-                    result = self.on_message(msg)
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception as e:
-                logger.error(f"[P2PNode] Message handler error for {peer_id}: {e}")
-            finally:
-                queue.task_done()
-
-    @staticmethod
-    def _encode_payload(payload: Any) -> Any:
-        """递归将 payload 编码为可 JSON 序列化的结构
-
-        - bytes -> {"__type__": "bytes", "__data__": "<base64>"}（解码时还原为 bytes）
-        - dict / list 递归处理内嵌的 bytes（如隧道消息 {..., "data": b'...'}）
-        - 其余原样返回（str / None / 数值等，须为 JSON 可序列化类型）
-        """
-        if isinstance(payload, bytes):
-            return {"__type__": "bytes", "__data__": base64.b64encode(payload).decode("ascii")}
-        if isinstance(payload, dict):
-            return {k: P2PNode._encode_payload(v) for k, v in payload.items()}
-        if isinstance(payload, (list, tuple)):
-            return [P2PNode._encode_payload(item) for item in payload]
-        return payload
-
-    @staticmethod
-    def _decode_payload(payload: Any) -> Any:
-        """将 JSON 结构还原为原始 payload"""
-        if isinstance(payload, dict):
-            # 仅当存在 __type__ 标记时才解码为 bytes，避免与用户合法字典冲突
-            if payload.get("__type__") == "bytes" and "__data__" in payload:
-                return base64.b64decode(payload["__data__"])
-            return {k: P2PNode._decode_payload(v) for k, v in payload.items()}
-        if isinstance(payload, list):
-            return [P2PNode._decode_payload(item) for item in payload]
-        return payload
+            self._msg_router.submit(queue_key, msg)
 
     def _encode_message(self, msg: Message) -> bytes:
-        """编码消息为 JSON 字节串（替代 pickle，避免反序列化安全风险）
-
-        仅支持 JSON 可序列化的 payload；bytes 通过 base64 内嵌。
-        """
-        return json.dumps(
-            {
-                "msg_id": msg.msg_id,
-                "msg_type": msg.msg_type.value,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "payload": self._encode_payload(msg.payload),
-                "timestamp": msg.timestamp.isoformat(),
-                "seq": msg.seq,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-    def _decode_message(self, data: bytes) -> Message:
-        """从 JSON 字节串解码消息"""
-        obj = json.loads(data.decode("utf-8"))
-        return Message(
-            msg_id=obj["msg_id"],
-            msg_type=MessageType(obj["msg_type"]),
-            sender_id=obj["sender_id"],
-            receiver_id=obj["receiver_id"],
-            payload=self._decode_payload(obj["payload"]),
-            seq=obj["seq"],
-        )
+        """编码消息为 JSON 字节串（委托给 ``message_codec``）"""
+        return encode_message(msg)
 
     async def send_to_peer(
         self,
@@ -774,8 +703,7 @@ class P2PNode:
         self._kcp_transports.clear()
         self._wait_answer_events.clear()
         self._negotiation_locks.clear()
-        self._peer_msg_queues.clear()
-        self._peer_msg_workers.clear()
+        await self._msg_router.stop_all()
 
         if self._signaling:
             await self._signaling.close()
