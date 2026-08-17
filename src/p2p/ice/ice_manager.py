@@ -37,6 +37,7 @@ except ImportError:
 # 因此先用小写变量承载导入状态，再一次性赋值给对外常量，消除重定义告警。
 AIORTC_AVAILABLE: bool = _aiortc_import_ok
 
+from .._utils import set_state, wait_event
 from ..config import IceConfig
 from ..types import (
     ConnectionState,
@@ -109,12 +110,8 @@ class IceManager:
         return self._peer_id
 
     def _set_state(self, state: ConnectionState) -> None:
-        if self.state != state:
-            old_state = self.state
-            self.state = state
-            logger.info(f"[ICE] State changed: {old_state} -> {state}")
-            if self.on_connection_state:
-                self.on_connection_state(state)
+        if set_state(self, state, context="ICE") and self.on_connection_state:
+            self.on_connection_state(state)
 
     def _build_rtc_config(self) -> RTCConfiguration | None:
         """构建 aiortc RTCConfiguration"""
@@ -169,14 +166,12 @@ class IceManager:
 
         logger.info("[ICE] Created SDP offer")
 
-        # 等待候选收集完成
-        try:
-            await asyncio.wait_for(
-                self._gathering_done_event.wait(),
-                timeout=self.config.gather_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[ICE] ICE gathering timeout, using current candidates")
+        # 等待候选收集完成（统一超时语义，超时不抛异常）
+        await wait_event(
+            self._gathering_done_event,
+            timeout=self.config.gather_timeout,
+            context="ICE gathering",
+        )
 
         sdp = self._pc.localDescription
         return SessionDescription(sdp_type=sdp.type, sdp=sdp.sdp)
@@ -208,13 +203,11 @@ class IceManager:
         logger.info("[ICE] Created SDP answer")
 
         # 等待候选收集
-        try:
-            await asyncio.wait_for(
-                self._gathering_done_event.wait(),
-                timeout=self.config.gather_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[ICE] ICE gathering timeout")
+        await wait_event(
+            self._gathering_done_event,
+            timeout=self.config.gather_timeout,
+            context="ICE gathering",
+        )
 
         sdp = self._pc.localDescription
         return SessionDescription(sdp_type=sdp.type, sdp=sdp.sdp)
@@ -359,10 +352,9 @@ class IceManager:
         ):
             self._data_channel_open.set()
             return True
-        try:
-            await asyncio.wait_for(self._data_channel_open.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
+        if not await wait_event(
+            self._data_channel_open, timeout=timeout, context="ICE DataChannel open"
+        ):
             # 最后再检查一次 readyState
             if (
                 self._data_channel
@@ -371,8 +363,8 @@ class IceManager:
             ):
                 self._data_channel_open.set()
                 return True
-            logger.warning("[ICE] DataChannel open timeout")
             return False
+        return True
 
     async def _extract_selected_candidates(self) -> None:
         """提取被选中的 ICE 候选对（用于 KCP 直连）。
@@ -410,12 +402,9 @@ class IceManager:
         if timeout is None:
             timeout = self.config.connectivity_check_timeout
 
-        try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning("[ICE] Connection timeout")
-            return False
+        return await wait_event(
+            self._connected_event, timeout=timeout, context="ICE connection"
+        )
 
     def get_relay_candidates(self) -> list[LocalIceCandidate]:
         """获取 TURN 中继候选地址"""

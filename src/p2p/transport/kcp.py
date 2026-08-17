@@ -12,7 +12,7 @@ from typing import Any
 
 from loguru import logger
 
-from .._utils import cancel_task
+from .._utils import cancel_task, set_state, wait_for_result
 from ..config import KcpConfig
 from ..types import ConnectionState, TransportStats, generate_peer_id
 from .kcp_core import KCP
@@ -74,12 +74,8 @@ class KCPTransport:
 
     def _set_state(self, state: ConnectionState) -> None:
         """设置连接状态并通知回调"""
-        if self.state != state:
-            old_state = self.state
-            self.state = state
-            logger.info(f"[KCP] State changed: {old_state} -> {state}")
-            if self.on_connection_state:
-                self.on_connection_state(state)
+        if set_state(self, state, context="KCP") and self.on_connection_state:
+            self.on_connection_state(state)
 
     def _kcp_output(self, data: bytes, _kcp: KCP, _user: Any) -> int:
         """KCP 输出回调 - 将 KCP 段通过 UDP 发送
@@ -157,17 +153,20 @@ class KCPTransport:
             await self._send_handshake()
 
             # 等待连接确认
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=10.0)
+            if await wait_for_result(
+                self._connected_event.wait(),
+                timeout=10.0,
+                default=False,
+                context=f"KCP connect to {remote_addr}",
+            ):
                 self._set_state(ConnectionState.CONNECTED)
                 logger.info(f"[KCP] Connected to {remote_addr}")
                 return True
-            except asyncio.TimeoutError:
-                logger.warning(f"[KCP] Connection timeout to {remote_addr}")
-                self._set_state(ConnectionState.FAILED)
-                # 失败必须清理 recv/update 循环，否则持续向无效地址发包刷错误
-                await self.close()
-                return False
+            logger.warning(f"[KCP] Connection timeout to {remote_addr}")
+            self._set_state(ConnectionState.FAILED)
+            # 失败必须清理 recv/update 循环，否则持续向无效地址发包刷错误
+            await self.close()
+            return False
 
         except Exception as e:
             logger.error(f"[KCP] Connect error: {e}")
@@ -202,16 +201,19 @@ class KCPTransport:
             self._update_task = asyncio.create_task(self._update_loop())
 
             # 等待握手数据
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=15.0)
+            if await wait_for_result(
+                self._connected_event.wait(),
+                timeout=15.0,
+                default=False,
+                context="KCP accept connection",
+            ):
                 self._set_state(ConnectionState.CONNECTED)
                 logger.info(f"[KCP] Connection accepted from {self._remote_addr}")
                 return True
-            except asyncio.TimeoutError:
-                logger.warning("[KCP] Accept connection timeout")
-                self._set_state(ConnectionState.FAILED)
-                await self.close()
-                return False
+            logger.warning("[KCP] Accept connection timeout")
+            self._set_state(ConnectionState.FAILED)
+            await self.close()
+            return False
 
         except Exception as e:
             logger.error(f"[KCP] Accept error: {e}")

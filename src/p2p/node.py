@@ -17,6 +17,7 @@ from typing import Any
 
 from loguru import logger
 
+from ._utils import set_state, spawn_task, wait_for_result
 from .config import (
     ConnectionRole,
     P2PConfig,
@@ -82,12 +83,10 @@ class P2PNode:
         self._wait_answer_events: dict[str, asyncio.Event] = {}
 
     def _set_state(self, state: ConnectionState) -> None:
-        if self.state != state:
-            old = self.state
-            self.state = state
-            logger.info(f"[P2PNode {self.peer_id}] State: {old} -> {state}")
-            if self.on_state_changed:
-                self.on_state_changed(self.peer_id, state)
+        if set_state(
+            self, state, context=f"P2PNode {self.peer_id}"
+        ) and self.on_state_changed:
+            self.on_state_changed(self.peer_id, state)
 
     # ========== 多 Peer IceManager 管理 ==========
 
@@ -194,9 +193,12 @@ class P2PNode:
             logger.info(f"[P2PNode] Offer sent to {target_peer_id}, waiting for answer...")
 
             # 4. 等待 Answer（per-peer event）
-            try:
-                await asyncio.wait_for(answer_event.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
+            if not await wait_for_result(
+                answer_event.wait(),
+                timeout=30.0,
+                default=False,
+                context=f"P2PNode answer from {target_peer_id}",
+            ):
                 logger.warning(f"[P2PNode] Timed out waiting for answer from {target_peer_id}")
                 await self._fail_peer_connection(target_peer_id, "answer timeout")
                 return False
@@ -278,16 +280,10 @@ class P2PNode:
         """本地产生 ICE 候选 - 通过信令发送给指定 peer"""
         if not self._signaling:
             return
-        task = asyncio.create_task(self._signaling.send_ice_candidate(peer_id, candidate))
-
-        def _log_candidate_error(t: asyncio.Task[Any]) -> None:
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc is not None:
-                logger.warning(f"[P2PNode] Failed to send ICE candidate to {peer_id}: {exc}")
-
-        task.add_done_callback(_log_candidate_error)
+        spawn_task(
+            self._signaling.send_ice_candidate(peer_id, candidate),
+            context=f"P2PNode send ICE candidate to {peer_id}",
+        )
 
     def _on_ice_state(self, peer_id: str, state: ConnectionState) -> None:
         """某 peer 的 ICE 状态变化
@@ -305,18 +301,12 @@ class P2PNode:
             ConnectionState.FAILED,
             ConnectionState.CLOSED,
         ):
-            # _cleanup_peer 是 async，但本回调是 sync；用 create_task 调度
-            # 并捕获清理过程中的异常，避免任务异常被 asyncio 静默丢弃。
-            cleanup_task = asyncio.create_task(self._cleanup_and_notify(peer_id))
-
-            def _log_cleanup_error(task: asyncio.Task[Any]) -> None:
-                if task.cancelled():
-                    return
-                exc = task.exception()
-                if exc is not None:
-                    logger.error(f"[P2PNode] Cleanup error for {peer_id}: {exc}")
-
-            cleanup_task.add_done_callback(_log_cleanup_error)
+            # _cleanup_peer 是 async，但本回调是 sync；用统一 spawn_task 调度，
+            # 异常由 spawn_task 内部接管并记录日志，避免任务被 asyncio 静默丢弃。
+            spawn_task(
+                self._cleanup_and_notify(peer_id),
+                context=f"P2PNode cleanup for {peer_id}",
+            )
 
     async def _cleanup_and_notify(self, peer_id: str) -> None:
         """ICE 断开后的清理 + 通知（幂等：仅在 was_connected 时通知一次）"""
@@ -485,19 +475,12 @@ class P2PNode:
             logger.info(f"[P2PNode] Auto-connecting to responder {peer.peer_id}")
             # 带重试的自动连接：首次握手可能因信令/ICE 时序等瞬时因素失败，
             # 若失败不重试，已运行的客户端将永远无法重新连上重启后的房间服务端
-            # （表现为"必须重启客户端才能连上"）。这里以指数退避重试若干次。
-            connect_task = asyncio.create_task(
-                self._auto_connect_with_retry(peer.peer_id, max_retries=3)
+            # （表现为"必须重启客户端才能连上"）。这里以指数退避重试若干次，
+            # 异常统一由 spawn_task 接管记录。
+            spawn_task(
+                self._auto_connect_with_retry(peer.peer_id, max_retries=3),
+                context=f"P2PNode auto-connect to {peer.peer_id}",
             )
-
-            def _log_connect_error(t: asyncio.Task[Any]) -> None:
-                if t.cancelled():
-                    return
-                exc = t.exception()
-                if exc is not None:
-                    logger.error(f"[P2PNode] Auto-connect to {peer.peer_id} failed: {exc}")
-
-            connect_task.add_done_callback(_log_connect_error)
 
     async def _auto_connect_with_retry(self, target_peer_id: str, max_retries: int = 3) -> None:
         """对自动连接进行指数退避重试。

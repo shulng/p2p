@@ -12,7 +12,7 @@ from typing import Any
 from loguru import logger
 
 from .._compat import WEBSOCKETS_AVAILABLE, websockets
-from .._utils import cancel_task
+from .._utils import cancel_task, dispatch, wait_for_result
 from ..config import ConnectionRole, SignalingConfig
 from ..types import (
     IceCandidate,
@@ -31,7 +31,7 @@ class SignalingEvents:
     """信令事件回调
 
     所有回调既支持同步函数，也支持异步协程函数。回调在 _handle_message
-    中通过 _dispatch 统一调度：异步回调用 create_task，同步回调直接调用。
+    中通过统一的 :func:`dispatch` 调度：异步回调用后台任务，同步回调直接调用。
     """
 
     on_offer: CallbackT | None = None
@@ -42,18 +42,6 @@ class SignalingEvents:
     on_room_info: CallbackT | None = None
     on_connected: CallbackT | None = None
     on_disconnected: CallbackT | None = None
-
-
-def _dispatch(callback: CallbackT | None, *args: object) -> None:
-    """调度回调：异步回调交给事件循环，同步回调直接执行。
-
-    若回调返回协程，则创建任务；否则视为同步回调直接调用。
-    """
-    if callback is None:
-        return
-    result = callback(*args)
-    if asyncio.iscoroutine(result):
-        asyncio.create_task(result)
 
 
 class SignalingClient:
@@ -109,7 +97,7 @@ class SignalingClient:
             if self.config.room_id:
                 await self._rejoin_room()
 
-            _dispatch(self.events.on_connected)
+            dispatch(self.events.on_connected)
 
             return True
 
@@ -133,10 +121,14 @@ class SignalingClient:
                     "role": self.config.room_role.value,
                 }
             )
-            try:
-                await asyncio.wait_for(self._join_event.wait(), timeout=10.0)
+            if await wait_for_result(
+                self._join_event.wait(),
+                timeout=10.0,
+                default=False,
+                context=f"SignalingClient re-join room {room_id}",
+            ):
                 logger.info(f"[SignalingClient] Re-joined room {room_id}")
-            except asyncio.TimeoutError:
+            else:
                 logger.warning("[SignalingClient] Re-join room timeout")
         except Exception as e:
             logger.error(f"[SignalingClient] Re-join room error: {e}")
@@ -161,13 +153,16 @@ class SignalingClient:
             )
 
             # 等待 JOIN 确认
-            try:
-                await asyncio.wait_for(self._join_event.wait(), timeout=10.0)
+            if await wait_for_result(
+                self._join_event.wait(),
+                timeout=10.0,
+                default=False,
+                context=f"SignalingClient join room {room_id}",
+            ):
                 logger.info(f"[SignalingClient] Joined room {room_id} as {role}")
                 return True
-            except asyncio.TimeoutError:
-                logger.warning("[SignalingClient] Join room timeout")
-                return False
+            logger.warning("[SignalingClient] Join room timeout")
+            return False
 
         except Exception as e:
             logger.error(f"[SignalingClient] Join room error: {e}")
@@ -239,7 +234,7 @@ class SignalingClient:
             self._connected = False
             self._connected_event.clear()
 
-            _dispatch(self.events.on_disconnected)
+            dispatch(self.events.on_disconnected)
 
             # 尝试重连
             if self._running:
@@ -281,7 +276,7 @@ class SignalingClient:
                 sdp_type=msg.get("sdp_type", "offer"),
                 sdp=msg.get("sdp", ""),
             )
-            _dispatch(self.events.on_offer, from_peer, offer)
+            dispatch(self.events.on_offer, from_peer, offer)
 
     def _handle_answer(self, msg: dict[str, Any]) -> None:
         """收到 Answer"""
@@ -291,7 +286,7 @@ class SignalingClient:
                 sdp_type=msg.get("sdp_type", "answer"),
                 sdp=msg.get("sdp", ""),
             )
-            _dispatch(self.events.on_answer, from_peer, answer)
+            dispatch(self.events.on_answer, from_peer, answer)
 
     def _handle_ice_candidate(self, msg: dict[str, Any]) -> None:
         """收到 ICE 候选"""
@@ -302,7 +297,7 @@ class SignalingClient:
                 sdp_mid=msg.get("sdp_mid"),
                 sdp_mline_index=msg.get("sdp_mline_index"),
             )
-            _dispatch(self.events.on_ice_candidate, from_peer, candidate)
+            dispatch(self.events.on_ice_candidate, from_peer, candidate)
 
     def _handle_room_info(self, msg: dict[str, Any]) -> None:
         """房间信息更新"""
@@ -318,11 +313,11 @@ class SignalingClient:
 
         for p in peers:
             if p.peer_id in joined and self.events.on_peer_joined and p.peer_id != self.peer_id:
-                _dispatch(self.events.on_peer_joined, p)
+                dispatch(self.events.on_peer_joined, p)
 
         for pid in left:
             if self.events.on_peer_left:
-                _dispatch(self.events.on_peer_left, pid)
+                dispatch(self.events.on_peer_left, pid)
 
         self.room_peers = peers
 

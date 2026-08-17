@@ -25,6 +25,7 @@ from typing import Any
 
 from loguru import logger
 
+from .._utils import spawn_task, wait_event
 from ..config import ConnectionRole, KcpConfig
 from .kcp import KCPTransport
 
@@ -156,8 +157,8 @@ class KCPDataTransport:
                 on_data_received=self._on_kcp_data,
             )
             self._local_kcp_addr = await self._kcp.bind()
-            # 开始接受连接(异步等待握手)
-            asyncio.create_task(self._kcp.accept_connection())
+            # 开始接受连接(异步等待握手)，统一经 spawn_task 接管异常
+            spawn_task(self._kcp.accept_connection(), context="KCP accept_connection")
             logger.info(f"[KCP] server bound on {self._local_kcp_addr}")
         except Exception as e:
             logger.warning(f"[KCP] bind failed: {e}")
@@ -224,7 +225,7 @@ class KCPDataTransport:
 
         # INITIATOR 收到地址后发起直连(后台,失败自动降级 SCTP)
         if self.role == ConnectionRole.INITIATOR and self._remote_kcp_addr:
-            asyncio.create_task(self._initiate_direct_connect())
+            spawn_task(self._initiate_direct_connect(), context="KCP initiate direct connect")
 
     async def _initiate_direct_connect(self) -> None:
         """INITIATOR 端:用收到的地址发起 KCP 直连"""
@@ -310,12 +311,9 @@ class KCPDataTransport:
 
     async def wait_for_addr_exchange(self, timeout: float = 10.0) -> bool:
         """等待地址交换完成"""
-        try:
-            await asyncio.wait_for(self._addr_exchanged.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning("[KCP] Address exchange timeout")
-            return False
+        return await wait_event(
+            self._addr_exchanged, timeout=timeout, context="KCP address exchange"
+        )
 
     def get_stats(self) -> KcpTransportStats:
         """返回当前传输统计，并同步通道就绪状态。"""

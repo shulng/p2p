@@ -21,6 +21,7 @@ from typing import Any, cast
 
 from loguru import logger
 
+from .._utils import spawn_task
 from ..config import ConnectionRole, P2PConfig
 from ..node import P2PNode
 from ..types import Message, PeerInfo, generate_id
@@ -212,7 +213,9 @@ class GameTunnel:
             # UDP 空闲清理只对 HOST 端有意义（_udp_relays 仅在 HOST 端填充），
             # 且清理逻辑在 _cleanup_udp_sessions 中按 UDP_SESSION_TIMEOUT 回收空闲会话。
             if proto in ("udp", "both"):
-                self._udp_cleanup_task = asyncio.create_task(self._cleanup_udp_sessions())
+                self._udp_cleanup_task = spawn_task(
+                    self._cleanup_udp_sessions(), context="Tunnel UDP cleanup"
+                )
             logger.info(f"Ready! Forwarding P2P -> {', '.join(targets)}")
         else:
             # CLIENT 端：启动本地监听
@@ -330,7 +333,10 @@ class GameTunnel:
                 await writer.drain()
 
             # 启动转发循环：本地服务 -> P2P
-            asyncio.create_task(self._forward_tcp_local_to_remote(conn_id, reader))
+            spawn_task(
+                self._forward_tcp_local_to_remote(conn_id, reader),
+                context=f"Tunnel forward tcp #{conn_id}",
+            )
         except Exception as e:
             logger.error(f"[Tunnel-TCP] Failed to connect to local target #{conn_id}: {e}")
             self._tcp_pending.pop(conn_id, None)
@@ -415,7 +421,10 @@ class GameTunnel:
             logger.debug(f"[Tunnel-UDP] New session #{conn_id} from {addr}")
 
         self._bytes_forwarded += len(data)
-        asyncio.create_task(self._send_tunnel_message(TUNNEL_UDP_DATA, conn_id, data))
+        spawn_task(
+            self._send_tunnel_message(TUNNEL_UDP_DATA, conn_id, data),
+            context=f"Tunnel udp data #{conn_id}",
+        )
 
     async def _handle_remote_udp_data(self, conn_id: str, data: bytes) -> None:
         """处理远端 UDP 数据"""
@@ -463,12 +472,18 @@ class GameTunnel:
     def _on_udp_relay_datagram(self, conn_id: str, data: bytes) -> None:
         """HOST 端：本地目标服务回包 -> 通过 P2P 转发回 CLIENT"""
         self._bytes_forwarded += len(data)
-        asyncio.create_task(self._send_tunnel_message(TUNNEL_UDP_DATA, conn_id, data))
+        spawn_task(
+            self._send_tunnel_message(TUNNEL_UDP_DATA, conn_id, data),
+            context=f"Tunnel udp relay datagram #{conn_id}",
+        )
 
     def _on_udp_relay_close(self, conn_id: str) -> None:
         """HOST 端：UDP relay 关闭"""
         self._udp_relays.pop(conn_id, None)
-        asyncio.create_task(self._send_tunnel_message(TUNNEL_UDP_CLOSE, conn_id, b""))
+        spawn_task(
+            self._send_tunnel_message(TUNNEL_UDP_CLOSE, conn_id, b""),
+            context=f"Tunnel udp relay close #{conn_id}",
+        )
         logger.info(f"[Tunnel-UDP] Relay #{conn_id} closed")
 
     async def _cleanup_udp_sessions(self) -> None:
@@ -516,7 +531,10 @@ class GameTunnel:
             self._conn_to_peer[conn_id] = msg.sender_id
 
         if tunnel_type == TUNNEL_TCP_OPEN:
-            asyncio.create_task(self._handle_remote_tcp_open(conn_id))
+            spawn_task(
+                self._handle_remote_tcp_open(conn_id),
+                context=f"Tunnel tcp open #{conn_id}",
+            )
         elif tunnel_type == TUNNEL_TCP_DATA:
             await self._handle_remote_tcp_data(conn_id, data)
         elif tunnel_type == TUNNEL_TCP_CLOSE:
@@ -586,14 +604,26 @@ class GameTunnel:
         for conn_id, pid in list(self._conn_to_peer.items()):
             if pid == peer_id:
                 self._conn_to_peer.pop(conn_id, None)
-                asyncio.create_task(self._handle_remote_tcp_close(conn_id))
-                asyncio.create_task(self._handle_remote_udp_close(conn_id))
+                spawn_task(
+                    self._handle_remote_tcp_close(conn_id),
+                    context=f"Tunnel tcp close #{conn_id}",
+                )
+                spawn_task(
+                    self._handle_remote_udp_close(conn_id),
+                    context=f"Tunnel udp close #{conn_id}",
+                )
         # 兜底：关闭所有 TCP/UDP 隧道（单 peer 场景）
         if not self._peer_ids:
             for conn_id in list(self._tcp_tunnels.keys()):
-                asyncio.create_task(self._handle_remote_tcp_close(conn_id))
+                spawn_task(
+                    self._handle_remote_tcp_close(conn_id),
+                    context=f"Tunnel tcp close #{conn_id}",
+                )
             for conn_id in list(self._udp_relays.keys()):
-                asyncio.create_task(self._handle_remote_udp_close(conn_id))
+                spawn_task(
+                    self._handle_remote_udp_close(conn_id),
+                    context=f"Tunnel udp close #{conn_id}",
+                )
 
     def get_stats(self) -> dict[str, Any]:
         """获取隧道统计"""

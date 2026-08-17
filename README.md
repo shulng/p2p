@@ -315,7 +315,7 @@ p2p/
 │   ├── config.py            # 配置类(P2PConfig / IceConfig / KcpConfig ...)
 │   ├── types.py             # 数据类型(Message / PeerInfo / ConnectionState ...)
 │   ├── _compat.py           # websockets 版本兼容层
-│   ├── _utils.py            # 公共工具函数(cancel_task 等)
+│   ├── _utils.py            # 统一公共调用模块(任务/超时/回调/状态/配置)
 │   ├── node.py              # P2P 节点(整合各层,门面)
 │   ├── main.py              # CLI 入口
 │   ├── transport/           # 传输层

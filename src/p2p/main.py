@@ -10,11 +10,8 @@ from dataclasses import dataclass
 
 from loguru import logger
 
-from .config import (
-    ConnectionRole,
-    IceConfig,
-    P2PConfig,
-)
+from ._utils import build_p2p_config, spawn_task
+from .config import ConnectionRole
 from .node import P2PNode
 from .tunnel.game_tunnel import GameTunnel, TunnelConfig
 from .types import Message, MessageType
@@ -34,13 +31,9 @@ def _setup_logger(level: str = "INFO") -> None:
     )
 
 
-def _base_config(role: ConnectionRole, signaling: str) -> P2PConfig:
-    cfg = P2PConfig(
-        role=role,
-        ice=IceConfig.with_cloudflare_turn(),
-    )
-    cfg.signaling.server_url = signaling
-    return cfg
+def _base_config(role: ConnectionRole, signaling: str) -> "P2PConfig":
+    """构建 P2P 配置（统一委托给公共模块 :func:`build_p2p_config`）。"""
+    return build_p2p_config(role, signaling)
 
 
 # ============== chat ==============
@@ -252,11 +245,7 @@ async def _run_tunnel(args: _TunnelArgs) -> int:
     # 打印实际映射
     _print_tunnel_mapping(is_server, protocol, tcp_port, udp_port)
 
-    p2p_cfg = P2PConfig(
-        role=role,
-        ice=IceConfig.with_cloudflare_turn(),
-    )
-    p2p_cfg.signaling.server_url = signaling
+    p2p_cfg = build_p2p_config(role, signaling)
 
     tunnel = GameTunnel(p2p_cfg, tunnel_cfg, role)
 
@@ -269,7 +258,7 @@ async def _run_tunnel(args: _TunnelArgs) -> int:
                 f"total={s['total_connections']} bytes={s['bytes_forwarded_mb']}MB"
             )
 
-    stats_task = asyncio.create_task(print_stats())
+    stats_task = spawn_task(print_stats(), context="Tunnel print stats")
     try:
         await tunnel.start(signaling, room)
         while True:

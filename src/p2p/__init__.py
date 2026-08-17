@@ -9,6 +9,15 @@
 
 __version__ = "0.1.0"
 
+from ._utils import (
+    build_p2p_config,
+    cancel_task,
+    dispatch,
+    set_state,
+    spawn_task,
+    wait_event,
+    wait_for_result,
+)
 from .config import (
     ConnectionRole,
     IceConfig,
@@ -49,6 +58,8 @@ __all__ = [
     "CHANNEL_CONTROL",
     "CHANNEL_DATA",
     "KCP",
+    "build_p2p_config",
+    "cancel_task",
     "ConnectionRole",
     "ConnectionState",
     "ConnectionStats",
@@ -61,6 +72,11 @@ __all__ = [
     "KcpConfig",
     "KcpTransportStats",
     "Message",
+    "dispatch",
+    "set_state",
+    "spawn_task",
+    "wait_event",
+    "wait_for_result",
     "MessageType",
     "P2PConfig",
     "P2PNode",
